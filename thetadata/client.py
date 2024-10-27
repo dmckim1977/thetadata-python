@@ -1,35 +1,49 @@
 """Module that contains Theta Client class."""
-from datetime import time
+import logging
+import socket
 import threading
 import time
 import traceback
-from decimal import Decimal
+from contextlib import contextmanager
+from datetime import time
 from threading import Thread
 from time import sleep
-from typing import Optional
-from contextlib import contextmanager
+from typing import Literal, Optional, get_args
 
-import socket
-import requests
-
+import httpx
+import pandas as pd
 from pandas import DataFrame
 from tqdm import tqdm
-import pandas as pd
 
 from . import terminal
 from .enums import *
-from .parsing import (
-    Header,
-    TickBody,
-    ListBody,
-    parse_list_REST, parse_flexible_REST, parse_hist_REST, parse_hist_REST_stream, parse_hist_REST_stream_ijson,
-)
+from .parsing import (Header, TickBody, parse_flexible_REST, parse_list, parse_trade, time_to_ms)
 from .terminal import check_download, launch_terminal
 
 _NOT_CONNECTED_MSG = "You must establish a connection first."
 _VERSION = '0.9.11'
 URL_BASE = "http://127.0.0.1:25510/"
 
+# region Define Literals # TODO move to another module
+SecurityType = Literal["option", "stock", "index"]
+OptionReqType = Literal["quote", "trade", "implied_volatility"]
+OptionRight = Literal['C', 'P']
+Terminal = Literal['MDDS', 'FPSS']
+# endregion
+
+def is_security_type(value: str):  # TODO error checking here
+    return value in get_args(SecurityType)
+
+
+def is_right(value: str):  # TODO error checking here
+    return value in get_args(OptionRight)
+
+
+def is_option_req(value: str):  # TODO error checking here
+    return value in get_args(OptionReqType)
+
+
+# endregion
 
 def _format_strike(strike: float) -> int:
     """Round USD to the nearest tenth of a cent, acceptable by the terminal."""
@@ -74,6 +88,7 @@ _pt_to_price_mul = [
 
 class Trade:
     """Trade representing all values provided by the Thetadata stream."""
+
     def __init__(self):
         """Dummy constructor"""
         self.ms_of_day = 0
@@ -109,12 +124,13 @@ class Trade:
     def to_string(self) -> str:
         """String representation of a trade."""
         return 'ms_of_day: ' + str(self.ms_of_day) + ' sequence: ' + str(self.sequence) + ' size: ' + str(self.size) + \
-               ' condition: ' + str(self.condition.name) + ' price: ' + str(self.price) + ' exchange: ' + \
-               str(self.exchange.value[1]) + ' date: ' + str(self.date)
+            ' condition: ' + str(self.condition.name) + ' price: ' + str(self.price) + ' exchange: ' + \
+            str(self.exchange.value[1]) + ' date: ' + str(self.date)
 
 
 class OHLCVC:
     """Trade representing all values provided by the Thetadata stream."""
+
     def __init__(self):
         """Dummy constructor"""
         self.ms_of_day = 0
@@ -131,12 +147,12 @@ class OHLCVC:
         view = memoryview(data)
         parse_int = lambda d: int.from_bytes(d, "big")
         self.ms_of_day = parse_int(view[0:4])
-        self.open   = round(parse_int(view[4:8]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
-        self.high   = round(parse_int(view[8:12]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
-        self.low    = round(parse_int(view[12:16]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
-        self.close  = round(parse_int(view[16:20]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
+        self.open = round(parse_int(view[4:8]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
+        self.high = round(parse_int(view[8:12]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
+        self.low = round(parse_int(view[12:16]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
+        self.close = round(parse_int(view[16:20]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
         self.volume = parse_int(view[20:24])
-        self.count  = parse_int(view[24:28])
+        self.count = parse_int(view[24:28])
         date_raw = str(parse_int(view[32:36]))
         self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
 
@@ -153,12 +169,13 @@ class OHLCVC:
     def to_string(self) -> str:
         """String representation of a trade."""
         return 'ms_of_day: ' + str(self.ms_of_day) + ' open: ' + str(self.open) + ' high: ' + str(self.high) + \
-               ' low: ' + str(self.low) + ' close: ' + str(self.close) + ' volume: ' + str(self.volume) +\
-               ' count: ' + str(self.count) + ' date: ' + str(self.date)
+            ' low: ' + str(self.low) + ' close: ' + str(self.close) + ' volume: ' + str(self.volume) + \
+            ' count: ' + str(self.count) + ' date: ' + str(self.date)
 
 
 class Quote:
     """Quote representing all values provided by the Thetadata stream."""
+
     def __init__(self):
         """Dummy constructor"""
         self.ms_of_day = 0
@@ -177,17 +194,17 @@ class Quote:
         view = memoryview(data)
         parse_int = lambda d: int.from_bytes(d, "big")
         mult = _pt_to_price_mul[parse_int(view[36:40])]
-        self.ms_of_day     = parse_int(view[0:4])
-        self.bid_size      = parse_int(view[4:8])
-        self.bid_exchange  = Exchange.from_code(parse_int(view[8:12]))
-        self.bid_price     = round(parse_int(view[12:16]) * mult, 4)
+        self.ms_of_day = parse_int(view[0:4])
+        self.bid_size = parse_int(view[4:8])
+        self.bid_exchange = Exchange.from_code(parse_int(view[8:12]))
+        self.bid_price = round(parse_int(view[12:16]) * mult, 4)
         self.bid_condition = QuoteCondition.from_code(parse_int(view[16:20]))
-        self.ask_size      = parse_int(view[20:24])
-        self.ask_exchange  = Exchange.from_code(parse_int(view[24:28]))
-        self.ask_price     = round(parse_int(view[28:32]) * mult, 4)
+        self.ask_size = parse_int(view[20:24])
+        self.ask_exchange = Exchange.from_code(parse_int(view[24:28]))
+        self.ask_price = round(parse_int(view[28:32]) * mult, 4)
         self.ask_condition = QuoteCondition.from_code(parse_int(view[32:36]))
-        date_raw           = str(parse_int(view[40:44]))
-        self.date          = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
+        date_raw = str(parse_int(view[40:44]))
+        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
 
     def copy_from(self, other_quote):
         self.ms_of_day = other_quote.ms_of_day
@@ -204,14 +221,15 @@ class Quote:
     def to_string(self) -> str:
         """String representation of a quote."""
         return 'ms_of_day: ' + str(self.ms_of_day) + ' bid_size: ' + str(self.bid_size) + ' bid_exchange: ' + \
-               str(self.bid_exchange.value[1]) + ' bid_price: ' + str(self.bid_price) + ' bid_condition: ' + \
-               str(self.bid_condition.name) + ' ask_size: ' + str(self.ask_size) + ' ask_exchange: ' +\
-               str(self.ask_exchange.value[1]) + ' ask_price: ' + str(self.ask_price) + ' ask_condition: ' \
-               + str(self.ask_condition.name) + ' date: ' + str(self.date)
+            str(self.bid_exchange.value[1]) + ' bid_price: ' + str(self.bid_price) + ' bid_condition: ' + \
+            str(self.bid_condition.name) + ' ask_size: ' + str(self.ask_size) + ' ask_exchange: ' + \
+            str(self.ask_exchange.value[1]) + ' ask_price: ' + str(self.ask_price) + ' ask_condition: ' \
+            + str(self.ask_condition.name) + ' date: ' + str(self.date)
 
 
 class OpenInterest:
     """Open Interest"""
+
     def __init__(self):
         """Dummy constructor"""
         self.open_interest = 0
@@ -236,6 +254,7 @@ class OpenInterest:
 
 class Contract:
     """Contract"""
+
     def __init__(self):
         """Dummy constructor"""
         self.root = ""
@@ -265,11 +284,12 @@ class Contract:
     def to_string(self) -> str:
         """String representation of open interest."""
         return 'root: ' + self.root + ' isOption: ' + str(self.isOption) + ' exp: ' + str(self.exp) + \
-               ' strike: ' + str(self.strike) + ' isCall: ' + str(self.isCall)
+            ' strike: ' + str(self.strike) + ' isCall: ' + str(self.isCall)
 
 
 class StreamMsg:
     """Stream Msg"""
+
     def __init__(self):
         self.client = None
         self.type = StreamMsgType.ERROR
@@ -283,12 +303,16 @@ class StreamMsg:
         self.date = None
 
 
+def is_security_type(literal: str):
+    return literal in get_args(SecurityType)
+
+
 class ThetaClient:
     """A high-level, blocking client used to fetch market data. Instantiating this class
     runs a java background process, which is responsible for the heavy lifting of market
     data communication. Java 11 or higher is required to use this class."""
 
-    def __init__(self, port: int = 11000, timeout: Optional[float] = 60, launch: bool = True, jvm_mem: int = 0,
+    def __init__(self, port: int = 25510, timeout: Optional[float] = 60, launch: bool = True, jvm_mem: int = 0,
                  username: str = "default", passwd: str = "default", auto_update: bool = True, use_bundle: bool = True,
                  host: str = "127.0.0.1", streaming_port: int = 10000, stable: bool = True):
         """Construct a client instance to interface with market data. If no username and passwd fields are provided,
@@ -325,18 +349,24 @@ class ThetaClient:
         if launch:
             terminal.kill_existing_terminal()
             if username == "default" or passwd == "default":
-                print('------------------------------------------------------------------------------------------------')
+                print(
+                    '------------------------------------------------------------------------------------------------')
                 print("You are using the free version of Theta Data. You are currently limited to "
                       "20 requests / minute.\nA data subscription can be purchased at https://thetadata.net. "
                       "If you already have a ThetaData\nsubscription, specify the username and passwd parameters.")
-                print('------------------------------------------------------------------------------------------------')
+                print(
+                    '------------------------------------------------------------------------------------------------')
             if check_download(auto_update, stable):
                 Thread(target=launch_terminal, args=[username, passwd, use_bundle, jvm_mem, auto_update]).start()
         else:
-            print("You are not launching the terminal. This means you should have an external instance already running.")
+            print(
+                "You are not launching the terminal. This means you should have an external instance already running.")
+
+
+    # region ######################## TERMINAL ############################ # TODO Needs some more work
 
     @contextmanager
-    def connect(self):
+    def connect(self): # TODO haven't touched yet
         """Initiate a connection with the Theta Terminal. Requests can only be made inside this
             generator aka the `with client.connect()` block.
 
@@ -362,6 +392,566 @@ class ThetaClient:
         finally:
             self._server.close()
 
+    def status(self, service: Optional[Terminal] = 'mdds'):
+
+        url = f"http://{self.host}:{self.port}/v2/system/{service}/status"
+        headers = {'Accept': "text/plain"}
+
+        try:
+            res = httpx.get(url, headers=headers).raise_for_status()
+            logging.info(res.text)
+
+        except httpx.HTTPError as exc:
+            logging.error(f'Could not get {service} status. Error: {exc}')
+        except Exception as e:
+            logging.error(f'Could not get {service} status. Error: {e}')
+
+    def kill(self, ignore_err=True) -> None:
+        """Remotely kill the Terminal process. All subsequent requests will time out after this. A new instance of this
+           class must be created.
+
+        """
+        try:
+            url = f"http://{self.host}:{self.port}/v2/system/terminal/shutdown"
+            res = httpx.get(url).raise_for_status()
+            logging.error(res.text)
+        except Exception as e:
+            logging.error(f'Could not close terminal. error: {e}')
+
+    # endregion
+
+    # region LISTING DATA
+
+    def expirations(self, root: str) -> pd.Series:
+        """
+        Get all options expirations for a provided underlying root.
+
+        :param root:           The root / underlying / ticker / symbol.
+        :param host:           The ip address of the server
+        :param port:           The port of the server
+
+        :return:               All expirations that ThetaData provides data for.
+        :raises ResponseError: If the request failed.
+        :raises NoData:        If there is no data available for the request.
+        """
+        url = f"http://{self.host}:{self.port}/v2/list/expirations"
+        params = {"root": root}
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_list(res=res, dates=True, name="expirations")
+        return df
+
+    def roots(self, security_type: SecurityType) -> pd.Series:
+        """
+        Get all roots for a certain security type.
+
+        :param sec: The type of security.
+
+        :return: All roots / underlyings / tickers / symbols for the security type.
+        :raises ResponseError: If the request failed.
+        :raises NoData:        If there is no data available for the request.
+        """
+
+        if not is_security_type(security_type):
+            raise ValueError(f'{security_type} is not a valid {SecurityType}')
+
+        url = f"http://{self.host}:{self.port}/v2/list/roots/{security_type}"
+        params = {}
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_list(res=res, dates=False, name="roots")
+        return df
+
+    def option_dates(
+            self,
+            req: str,
+            root: str,
+            exp: int,
+            right: Optional[OptionRight] = None,
+            strike: Optional[int] = None) -> pd.Series:
+        """
+        Get all dates of data available for a given options contract and request type.
+
+        :param req:            The request type.
+        :param sec:             The security type.
+        :param root:           The root / underlying / ticker / symbol.
+        :param exp:            The expiration date. Must be after the start of `date_range`.
+        :param strike:         The strike price in USD.
+        :param right:          The right of an options.
+
+        :return:               All dates that Theta Data provides data for given a request.
+        :raises ResponseError: If the request failed.
+        :raises NoData:        If there is no data available for the request.
+        """
+        # explicit is better than implicit
+        sec = "option"
+
+        url = f"http://{self.host}:{self.port}/v2/list/dates/{sec}/{req}"
+
+        params = {'root': root, 'exp': exp}
+
+        # Add optional params if specific strike and expiration are wanted.
+        if right is not None and strike is not None:
+            params['right'] = right
+            params['strike'] = strike
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_list(res, dates=True, name='dates')
+        return df
+
+    def strikes(
+            self,
+            root: str,
+            exp: int) -> pd.Series:
+        """
+        Get all options strike prices in US tenths of a cent.
+
+        :param root:           The root / underlying / ticker / symbol.
+        :param exp:            The expiration date.
+        :param date_range:     If specified, this function will return strikes only if they have data for every
+                                day in the date range.
+        :param host:           The ip address of the server
+        :param port:           The port of the server
+
+        :return:               The strike prices on the expiration.
+        :raises ResponseError: If the request failed.
+        :raises NoData:        If there is no data available for the request.
+        """
+
+        params = {"root": root, "exp": exp}
+        url = f"http://{self.host}:{self.port}/v2/list/strikes"
+        res = httpx.get(url, params=params).raise_for_status().json()
+        ser = parse_list(res=res, dates=False, name="strikes")
+        ser = ser.divide(1000)
+        return ser
+
+    def contracts(
+            self,
+            root: str,
+            start_date: int,
+            req: OptionReqType) -> pd.DataFrame:
+        """
+        Get all options strike prices in US tenths of a cent.
+
+        :param root:           The root / underlying / ticker / symbol.
+        :param exp:            The expiration date.
+        :param date_range:     If specified, this function will return strikes only if they have data for every
+                                day in the date range.
+        :param host:           The ip address of the server
+        :param port:           The port of the server
+
+        :return:               The strike prices on the expiration.
+        :raises ResponseError: If the request failed.
+        :raises NoData:        If there is no data available for the request.
+        """
+
+        params = {"root": root, "start_date": start_date}
+        url = f"http://{self.host}:{self.port}/v2/list/contracts/option/{req}"
+        res = httpx.get(url, params=params).raise_for_status().json()
+        cars = parse_trade(res=res)
+        return cars
+
+    # endregion
+
+    # region AT TIME
+    def quote_at_time(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: str,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: Optional[bool] = True) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/at_time/option/quote"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": time_to_ms(ivl),
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def trade_at_time(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: str,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: Optional[bool] = True) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/at_time/option/trade"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": time_to_ms(ivl),
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    # endregion
+
+    # region BULK AT TIME
+    # TODO Empty dataframe. Check later.
+    def bulk_quote_at_time(
+            self,
+            start_date: int,
+            end_date: int,
+            ivl: str,
+            root: str,
+            exp: Optional[int] = 0,
+            rth: Optional[bool] = True) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/bulk_at_time/option/quote"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": time_to_ms(ivl),
+            "root": root,
+            "rth": rth
+        }
+
+        res = httpx.get(url, params=params, timeout=120).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    # TODO empty dataframe. Check later
+    def bulk_trade_at_time(
+            self,
+            start_date: int,
+            end_date: int,
+            ivl: str,
+            root: str,
+            exp: Optional[int] = 0,
+            rth: Optional[bool] = True) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/bulk_at_time/option/trade"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": time_to_ms(ivl),
+            "root": root,
+            "rth": rth
+        }
+
+        res = httpx.get(url, params=params, timeout=120).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    # endregion
+
+    # region HISTORICAL DATA
+    def historical_eod_report(
+        self,
+        start_date: int,
+        end_date: int,
+        exp: int,
+        right: OptionRight,
+        root: str,
+        strike: float) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/option/eod"
+
+        params = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "exp": exp,
+        "right": right,
+        "root": root,
+        "strike": strike,
+
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_quotes(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/option/quote"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+
+        }
+        if start_time:
+            params["start_time"] = time_to_ms(start_time)
+        if start_time:
+            params["end_time"] = time_to_ms(end_time)
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_ohlc(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/option/ohlc"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+
+        }
+        if start_time:
+            params["start_time"] = time_to_ms(start_time)
+        if start_time:
+            params["end_time"] = time_to_ms(end_time)
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_open_interest(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/option/open_interest"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+
+        }
+        if start_time:
+            params["start_time"] = time_to_ms(start_time)
+        if start_time:
+            params["end_time"] = time_to_ms(end_time)
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_trades(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/option/trade"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+
+        }
+        if start_time:
+            params["start_time"] = time_to_ms(start_time)
+        if start_time:
+            params["end_time"] = time_to_ms(end_time)
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_trade_quote(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            exclusive: bool = True) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/option/trade_quote"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+            "exclusive": exclusive,
+
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    # endregion
+
+    # region HISTORICAL GREEKS
+    def historical_implied_volatility(self):
+        ...
+
+    def historical_greeks(self):
+        ...
+
+    def historical_greeks_second_order(self):
+        ...
+
+    def historical_greeks_third_order(self):
+        ...
+
+    def historical_all_greeks(self):
+        ...
+
+    def historical_trade_greeks(self):
+        ...
+
+    def historical_trade_greeks_second_order(self):
+        ...
+
+    def historical_trade_greeks_third_order(self):
+        ...
+
+    # endregion
+
+    # region BULK HISTORICAL DATA
+
+    # endregion
+
+    # region BULK HISTORICAL GREEKS
+
+    # endregion
+
+    # region SNAPSHOTS
+
+    # endregion
+
+    # region BULK SNAPSHOTS
+
+    # endregion
+
+    # region #################### STOCKS ########################
+
+    # region HISTORICAL DATA
+
+    def stock_historical_eod_report(
+            self,
+            start_date: int,
+            end_date: int,
+            root: str) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/stock/eod"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "root": root,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    # endregion
+
+    # endregion
+
+    # region ################### INDICES ########################
+
+    def index_eod_report(
+            self,
+            start_date: int,
+            end_date: int,
+            root: str) -> pd.DataFrame:
+
+        url = f"http://{self.host}:{self.port}/v2/hist/index/eod"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "root": root,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    # endregion
+
+    # region ################# STREAMING ########################## # TODO Have not touched yet
     def connect_stream(self, callback) -> Thread:
         """Initiate a connection with the Theta Terminal Stream server.
         Requests can only be made inside this generator aka the `with client.connect_stream()` block.
@@ -626,819 +1216,6 @@ class ThetaClient:
         assert bytes_downloaded == n_bytes
         return buffer
 
-    def kill(self, ignore_err=True) -> None:
-        """Remotely kill the Terminal process. All subsequent requests will time out after this. A new instance of this
-           class must be created.
-        """
-        if not ignore_err:
-            assert self._server is not None, _NOT_CONNECTED_MSG
+    # endregion
 
-        kill_msg = f"MSG_CODE={MessageType.KILL.value}\n"
-        try:
-            self._server.sendall(kill_msg.encode("utf-8"))
-        except OSError:
-            if ignore_err:
-                pass
-            else:
-                raise OSError
-
-    # HIST DATA
-
-    def get_hist_option(
-        self,
-        req: OptionReqType,
-        root: str,
-        exp: date,
-        strike: float,
-        right: OptionRight,
-        date_range: DateRange,
-        interval_size: int = 0,
-        use_rth: bool = True,
-        progress_bar: bool = False,
-    ) -> pd.DataFrame:
-        """
-         Get historical options data.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-        :param strike:         The strike price in USD, rounded to 1/10th of a cent.
-        :param right:          The right of an option. CALL = Bullish; PUT = Bearish
-        :param date_range:     The dates to fetch.
-        :param interval_size:  The interval size in milliseconds. Applicable to most requests except ReqType.TRADE.
-        :param use_rth:        If true, timestamps prior to 09:30 EST and after 16:00 EST will be ignored
-                                  (only applicable to intervals requests).
-        :param progress_bar:   Print a progress bar displaying download progress.
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        # format data
-        strike = _format_strike(strike)
-        exp_fmt = _format_date(exp)
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-
-        # send request
-        hist_msg = f"MSG_CODE={MessageType.HIST.value}&START_DATE={start_fmt}&END_DATE={end_fmt}&root={root}&exp={exp_fmt}&strike={strike}&right={right.value}&sec={SecType.OPTION.value}&req={req.value}&rth={use_rth}&IVL={interval_size}\n"
-        self._server.sendall(hist_msg.encode("utf-8"))
-
-        # parse response header
-        header_data = self._server.recv(20)
-        header: Header = Header.parse(hist_msg, header_data)
-
-        # parse response body
-        body_data = self._recv(header.size, progress_bar=progress_bar)
-        body: DataFrame = TickBody.parse(hist_msg, header, body_data)
-        return body
-
-    def get_hist_option_REST(
-        self,
-        req: OptionReqType,
-        root: str,
-        exp: date,
-        strike: float,
-        right: OptionRight,
-        date_range: DateRange,
-        interval_size: int = 0,
-        use_rth: bool = True,
-        host: str = "127.0.0.1",
-        port: str = "25510"
-    ) -> pd.DataFrame:
-        """
-         Get historical options data.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-        :param strike:         The strike price in USD, rounded to 1/10th of a cent.
-        :param right:          The right of an option. CALL = Bullish; PUT = Bearish
-        :param date_range:     The dates to fetch.
-        :param interval_size:  The interval size in milliseconds. Applicable to most requests except ReqType.TRADE.
-        :param use_rth:        If true, timestamps prior to 09:30 EST and after 16:00 EST will be ignored
-                                  (only applicable to intervals requests).
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        req_fmt = req.name.lower()
-        strike_fmt = _format_strike(strike)
-        exp_fmt = _format_date(exp)
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-        right_fmt = right.value
-        use_rth_fmt = str(use_rth).lower()
-        url = f"http://{host}:{port}/hist/option/{req_fmt}"
-        querystring = {"root": root, "start_date": start_fmt, "end_date": end_fmt,
-                       "strike": strike_fmt, "exp": exp_fmt, "right": right_fmt,
-                       "ivl": interval_size, "rth": use_rth_fmt}
-        t1 = time.time()
-        response = requests.get(url, params=querystring)
-        t2 = time.time()
-        df = parse_flexible_REST(response)
-        t3 = time.time()
-
-        return df
-
-    def get_opt_at_time(
-            self,
-            req: OptionReqType,
-            root: str,
-            exp: date,
-            strike: float,
-            right: OptionRight,
-            date_range: DateRange,
-            ms_of_day: int = 0,
-    ) -> pd.DataFrame:
-        """
-         Returns the last tick at a provided millisecond of the day for a given request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-        :param strike:         The strike price in USD, rounded to 1/10th of a cent.
-        :param right:          The right of an option. CALL = Bullish; PUT = Bearish
-        :param date_range:     The dates to fetch.
-        :param ms_of_day:      The time of day in milliseconds.
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        # format data
-        strike = _format_strike(strike)
-        exp_fmt = _format_date(exp)
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-
-        # send request
-        hist_msg = f"MSG_CODE={MessageType.AT_TIME.value}&START_DATE={start_fmt}&END_DATE={end_fmt}&root={root}&exp={exp_fmt}&strike={strike}&right={right.value}&sec={SecType.OPTION.value}&req={req.value}&IVL={ms_of_day}\n"
-        self._server.sendall(hist_msg.encode("utf-8"))
-
-        # parse response header
-        header_data = self._server.recv(20)
-        header: Header = Header.parse(hist_msg, header_data)
-
-        # parse response body
-        body_data = self._recv(header.size, progress_bar=False)
-        body: DataFrame = TickBody.parse(hist_msg, header, body_data)
-        return body
-
-    def get_opt_at_time_REST(
-            self,
-            req: OptionReqType,
-            root: str,
-            exp: date,
-            strike: float,
-            right: OptionRight,
-            date_range: DateRange,
-            ms_of_day: int = 0,
-            host: str = "127.0.0.1",
-            port: str = "25510"
-    ) -> pd.DataFrame:
-        """
-         Returns the last tick at a provided millisecond of the day for a given request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-        :param strike:         The strike price in USD, rounded to 1/10th of a cent.
-        :param right:          The right of an option. CALL = Bullish; PUT = Bearish
-        :param date_range:     The dates to fetch.
-        :param ms_of_day:      The time of day in milliseconds.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        # format data
-        req_fmt = req.name.lower()
-        strike_fmt = _format_strike(strike)
-        exp_fmt = _format_date(exp)
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-        right_fmt = right.value
-
-        url = f"http://{host}:{port}/at_time/option/{req_fmt}"
-        querystring = {"root": root, "start_date": start_fmt, "end_date": end_fmt, "strike": strike_fmt,
-                       "exp": exp_fmt, "right": right_fmt, "ivl": ms_of_day}
-        response = requests.get(url, params=querystring)
-        df = parse_flexible_REST(response)
-        return df
-
-    def get_stk_at_time(
-            self,
-            req: StockReqType,
-            root: str,
-            date_range: DateRange,
-            ms_of_day: int = 0,
-    ) -> pd.DataFrame:
-        """
-         Returns the last tick at a provided millisecond of the day for a given request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param date_range:     The dates to fetch.
-        :param ms_of_day:      The time of day in milliseconds.
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        # format data
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-
-        # send request
-        hist_msg = f"MSG_CODE={MessageType.AT_TIME.value}&START_DATE={start_fmt}&END_DATE={end_fmt}&root={root}&sec={SecType.STOCK.value}&req={req.value}&IVL={ms_of_day}\n"
-        self._server.sendall(hist_msg.encode("utf-8"))
-
-        # parse response header
-        header_data = self._server.recv(20)
-        header: Header = Header.parse(hist_msg, header_data)
-
-        # parse response body
-        body_data = self._recv(header.size, progress_bar=False)
-        body: DataFrame = TickBody.parse(hist_msg, header, body_data)
-        return body
-
-    def get_stk_at_time_REST(
-            self,
-            req: StockReqType,
-            root: str,
-            date_range: DateRange,
-            ms_of_day: int = 0,
-            host: str = "127.0.0.1",
-            port: str = "25510"
-    ) -> pd.DataFrame:
-        """
-         Returns the last tick at a provided millisecond of the day for a given request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param date_range:     The dates to fetch.
-        :param ms_of_day:      The time of day in milliseconds.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        req_fmt = req.name.lower()
-        root_fmt = root.lower()
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-
-        url = f"http://{host}:{port}/at_time/stock/{req_fmt}"
-        querystring = {"root": root_fmt, "start_date": start_fmt,
-                       "end_date": end_fmt, "ivl": ms_of_day}
-        response = requests.get(url, params=querystring)
-        df = parse_flexible_REST(response)
-        return df
-
-    def get_hist_stock(
-            self,
-            req: StockReqType,
-            root: str,
-            date_range: DateRange,
-            interval_size: int = 0,
-            use_rth: bool = True,
-            progress_bar: bool = False,
-    ) -> pd.DataFrame:
-        """
-         Get historical stock data.
-
-        :param req:            The request type.
-        :param root:           The root symbol.
-        :param date_range:     The dates to fetch.
-        :param interval_size:  The interval size in milliseconds. Applicable only to OHLC & QUOTE requests.
-        :param use_rth:         If true, timestamps prior to 09:30 EST and after 16:00 EST will be ignored.
-        :param progress_bar:   Print a progress bar displaying download progress.
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        # format data
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-
-        # send request
-        hist_msg = f"MSG_CODE={MessageType.HIST.value}&START_DATE={start_fmt}&END_DATE={end_fmt}&root={root}&sec={SecType.STOCK.value}&req={req.value}&rth={use_rth}&IVL={interval_size}\n"
-        self._server.sendall(hist_msg.encode("utf-8"))
-
-        # parse response header
-        header_data = self._server.recv(20)
-        header: Header = Header.parse(hist_msg, header_data)
-
-        # parse response body
-        body_data = self._recv(header.size, progress_bar=progress_bar)
-        body: DataFrame = TickBody.parse(hist_msg, header, body_data)
-        return body
-
-    def get_hist_stock_REST(
-            self,
-            req: StockReqType,
-            root: str,
-            date_range: DateRange,
-            interval_size: int = 0,
-            use_rth: bool = True,
-            host: str = "127.0.0.1",
-            port: str = "25510"
-    ) -> pd.DataFrame:
-        """
-         Get historical stock data.
-
-        :param req:            The request type.
-        :param root:           The root symbol.
-        :param date_range:     The dates to fetch.
-        :param interval_size:  The interval size in milliseconds. Applicable only to OHLC & QUOTE requests.
-        :param use_rth:         If true, timestamps prior to 09:30 EST and after 16:00 EST will be ignored.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        # format data
-        req_fmt = req.name.lower()
-        start_fmt = _format_date(date_range.start)
-        end_fmt = _format_date(date_range.end)
-        use_rth_fmt = str(use_rth).lower()
-        url = f"http://{host}:{port}/hist/stock/{req_fmt}"
-        params = {"root": root, "start_date": start_fmt, "end_date": end_fmt,
-                      "ivl": interval_size, "rth": use_rth_fmt}
-        response = requests.get(url, params=params)
-        df = parse_flexible_REST(response)
-        return df
-
-    # LISTING DATA
-
-    def get_dates_stk(self, root: str, req: StockReqType) -> pd.Series:
-        """
-        Get all dates of data available for a given stock contract and request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-
-        :return:               All dates that Theta Data provides data for given a request.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        out = f"MSG_CODE={MessageType.ALL_DATES.value}&root={root}&sec={SecType.STOCK.value}&req={req.value}\n"
-        self._server.send(out.encode("utf-8"))
-        header = Header.parse(out, self._server.recv(20))
-        body = ListBody.parse(out, header, self._recv(header.size), dates=True)
-        return body.lst
-
-    def get_dates_stk_REST(self, root: str, req: StockReqType, host: str = "127.0.0.1", port: str = "25510") -> pd.Series:
-        """
-        Get all dates of data available for a given stock contract and request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               dAll dates that Theta Data provides data for given a request.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        root_fmt = root.lower()
-        req_fmt = req.name.lower()
-        url = f"http://{host}:{port}/list/dates/stock/{req_fmt}"
-        params = {'root': root_fmt}
-        response = requests.get(url, params=params)
-        series = parse_list_REST(response, dates=True)
-        return series
-
-    def get_dates_opt(
-            self,
-            req: OptionReqType,
-            root: str,
-            exp: date,
-            strike: float,
-            right: OptionRight) -> pd.Series:
-        """
-        Get all dates of data available for a given options contract and request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-        :param strike:         The strike price in USD.
-        :param right:          The right of an options.
-
-        :return:               All dates that Theta Data provides data for given a request.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        strike = _format_strike(strike)
-        exp_fmt = _format_date(exp)
-        out = f"MSG_CODE={MessageType.ALL_DATES.value}&root={root}&exp={exp_fmt}&strike={strike}&right={right.value}&sec={SecType.OPTION.value}&req={req.value}\n"
-        self._server.send(out.encode("utf-8"))
-        header = Header.parse(out, self._server.recv(20))
-        body = ListBody.parse(out, header, self._recv(header.size), dates=True)
-        return body.lst
-
-    def get_dates_opt_REST(
-            self,
-            req: OptionReqType,
-            root: str,
-            exp: date,
-            strike: float,
-            right: OptionRight,
-            host: str = "127.0.0.1",
-            port: str = "25510") -> pd.Series:
-        """
-        Get all dates of data available for a given options contract and request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-        :param strike:         The strike price in USD.
-        :param right:          The right of an options.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               All dates that Theta Data provides data for given a request.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        req = req.name.lower()
-        exp_fmt = _format_date(exp)
-        strike_fmt = _format_strike(strike)
-        right = right.value
-        sec = SecType.OPTION.value.lower()
-        url = f"http://{host}:{port}/list/dates/{sec}/{req}"
-        params = {'root': root, 'exp': exp_fmt, 'strike': strike_fmt, 'right': right}
-        response = requests.get(url, params=params)
-        df = parse_list_REST(response, dates=True)
-        return df
-
-    def get_dates_opt_bulk(
-            self,
-            req: OptionReqType,
-            root: str,
-            exp: date) -> pd.Series:
-        """
-        Get all dates of data available for a given options expiration and request type.
-
-        :param req:            The request type.
-        :param root:           The root symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-
-        :return:               All dates that Theta Data provides data for given options chain (expiration).
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        exp_fmt = _format_date(exp)
-        out = f"MSG_CODE={MessageType.ALL_DATES_BULK.value}&root={root}&exp={exp_fmt}&sec={SecType.OPTION.value}&req={req.value}\n"
-        self._server.send(out.encode("utf-8"))
-        header = Header.parse(out, self._server.recv(20))
-        body = ListBody.parse(out, header, self._recv(header.size), dates=True)
-        return body.lst
-
-    def get_dates_opt_bulk_REST(
-            self,
-            req: OptionReqType,
-            root: str,
-            exp: date,
-            host: str = "127.0.0.1",
-            port: str = "25510") -> pd.Series:
-        """
-        Get all dates of data available for a given options contract and request type.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date. Must be after the start of `date_range`.
-        :param strike:         The strike price in USD.
-        :param right:          The right of an options.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               All dates that Theta Data provides data for given a request.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        req = req.name.lower()
-        exp_fmt = _format_date(exp)
-        sec = SecType.OPTION.value.lower()
-        url = f"http://{host}:{port}/list/dates/{sec}/{req}"
-        params = {'root': root, 'exp': exp_fmt}
-        response = requests.get(url, params=params)
-        df = parse_list_REST(response, dates=True)
-        return df
-
-    def get_expirations(self, root: str) -> pd.Series:
-        """
-        Get all options expirations for a provided underlying root.
-
-        :param root:           The root / underlying / ticker / symbol.
-
-        :return:               All expirations that ThetaData provides data for.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        out = f"MSG_CODE={MessageType.ALL_EXPIRATIONS.value}&root={root}\n"
-        self._server.send(out.encode("utf-8"))
-        header = Header.parse(out, self._server.recv(20))
-        body = ListBody.parse(out, header, self._recv(header.size), dates=True)
-        return body.lst
-
-    def get_expirations_REST(self, root: str, host: str = "127.0.0.1", port: str = "25510") -> pd.Series:
-        """
-        Get all options expirations for a provided underlying root.
-
-        :param root:           The root / underlying / ticker / symbol.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               All expirations that ThetaData provides data for.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        url = f"http://{host}:{port}/list/expirations"
-        params = {"root": root}
-        response = requests.get(url, params=params)
-        df = parse_list_REST(response, dates=True)
-        return df
-
-    def get_strikes(self, root: str, exp: date, date_range: DateRange = None,) -> pd.Series:
-        """
-        Get all options strike prices in US tenths of a cent.
-
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date.
-        :param date_range:     If specified, this function will return strikes only if they have data for every
-                                day in the date range.
-
-        :return:               The strike prices on the expiration.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        assert isinstance(exp, date)
-        exp_fmt = _format_date(exp)
-
-        if date_range is not None:
-            start_fmt = _format_date(date_range.start)
-            end_fmt = _format_date(date_range.end)
-            out = f"MSG_CODE={MessageType.ALL_STRIKES.value}&root={root}&exp={exp_fmt}&START_DATE={start_fmt}&END_DATE={end_fmt}\n"
-        else:
-            out = f"MSG_CODE={MessageType.ALL_STRIKES.value}&root={root}&exp={exp_fmt}\n"
-        self._server.send(out.encode("utf-8"))
-        header = Header.parse(out, self._server.recv(20))
-        body = ListBody.parse(out, header, self._recv(header.size)).lst
-        div = Decimal(1000)
-        s = pd.Series([], dtype='float64')
-        c = 0
-        for i in body:
-            s[c] = Decimal(i) / div
-            c += 1
-
-        return s
-
-
-    def get_strikes_REST(self, root: str, exp: date, date_range: DateRange = None, host: str = "127.0.0.1", port: str = "25510") -> pd.Series:
-        """
-        Get all options strike prices in US tenths of a cent.
-
-        :param root:           The root / underlying / ticker / symbol.
-        :param exp:            The expiration date.
-        :param date_range:     If specified, this function will return strikes only if they have data for every
-                                day in the date range.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               The strike prices on the expiration.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert isinstance(exp, date)
-        exp_fmt = _format_date(exp)
-        root_fmt = root.lower()
-        if date_range is not None:
-            start_fmt = _format_date(date_range.start)
-            end_fmt = _format_date(date_range.end)
-            querystring = {"root": root_fmt, "exp": exp_fmt}
-        else:
-            querystring = {"root": root_fmt, "exp": exp_fmt}
-        url = f"http://{host}:{port}/list/strikes"
-        response = requests.get(url, params=querystring)
-        ser = parse_list_REST(response)
-        ser = ser.divide(1000)
-        return ser
-
-    def get_roots(self, sec: SecType) -> pd.Series:
-        """
-        Get all roots for a certain security type.
-
-        :param sec: The type of security.
-
-        :return: All roots / underlyings / tickers / symbols for the security type.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        out = f"MSG_CODE={MessageType.ALL_ROOTS.value}&sec={sec.value}\n"
-        self._server.send(out.encode("utf-8"))
-        header = Header.parse(out, self._server.recv(20))
-        body = ListBody.parse(out, header, self._recv(header.size))
-        return body.lst
-
-    def get_roots_REST(self, sec: SecType, host: str = "127.0.0.1", port: str = "25510") -> pd.Series:
-        """
-        Get all roots for a certain security type.
-
-        :param sec: The type of security.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return: All roots / underlyings / tickers / symbols for the security type.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        url = f"http://{host}:{port}/list/roots"
-        params = {'sec': sec.value}
-        response = requests.get(url, params=params)
-        df = parse_list_REST(response)
-        return df
-
-    # LIVE DATA
-
-    def get_last_option(
-        self,
-        req: OptionReqType,
-        root: str,
-        exp: date,
-        strike: float,
-        right: OptionRight,
-    ) -> pd.DataFrame:
-        """
-        Get the most recent options tick.
-
-        :param req:            The request type.
-        :param root:           The root symbol.
-        :param exp:            The expiration date.
-        :param strike:         The strike price in USD, rounded to 1/10th of a cent.
-        :param right:          The right of an options.
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        # format data
-        strike = _format_strike(strike)
-        exp_fmt = _format_date(exp)
-
-        # send request
-        hist_msg = f"MSG_CODE={MessageType.LAST.value}&root={root}&exp={exp_fmt}&strike={strike}&right={right.value}&sec={SecType.OPTION.value}&req={req.value}\n"
-        self._server.sendall(hist_msg.encode("utf-8"))
-
-        # parse response
-        header: Header = Header.parse(hist_msg, self._server.recv(20))
-        body: DataFrame = TickBody.parse(
-            hist_msg, header, self._recv(header.size)
-        )
-        return body
-
-    def get_last_option_REST(
-        self,
-        req: OptionReqType,
-        root: str,
-        exp: date,
-        strike: float,
-        right: OptionRight,
-        host: str = "127.0.0.1",
-        port: str = "25510"
-    ) -> pd.DataFrame:
-        """
-        Get the most recent options tick.
-
-        :param req:            The request type.
-        :param root:           The root symbol.
-        :param exp:            The expiration date.
-        :param strike:         The strike price in USD, rounded to 1/10th of a cent.
-        :param right:          The right of an options.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        root_fmt = root.lower()
-        req_fmt = req.name.lower()
-        right_fmt = right.value
-        strike_fmt = _format_strike(strike)
-        exp_fmt = _format_date(exp)
-
-        url = f"http://{host}:{port}/snapshot/option/{req_fmt}"
-        querystring = {"root": root_fmt, "strike": strike_fmt, "exp": exp_fmt, "right": right_fmt}
-        response = requests.get(url, params=querystring)
-        df = parse_flexible_REST(response)
-        return df
-
-    def get_last_stock(
-        self,
-        req: StockReqType,
-        root: str,
-    ) -> pd.DataFrame:
-        """
-        Get the most recent stock tick.
-
-        :param req:            The request type.
-        :param root:           The root / underlying / ticker / symbol.
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-
-        # send request
-        hist_msg = f"MSG_CODE={MessageType.LAST.value}&root={root}&sec={SecType.STOCK.value}&req={req.value}\n"
-        self._server.sendall(hist_msg.encode("utf-8"))
-
-        # parse response
-        header: Header = Header.parse(hist_msg, self._server.recv(20))
-        body: DataFrame = TickBody.parse(
-            hist_msg, header, self._recv(header.size)
-        )
-        return body
-
-    def get_last_stock_REST(
-        self,
-        req: StockReqType,
-        root: str,
-        host: str = "127.0.0.1",
-        port: str = "25510"
-    ) -> pd.DataFrame:
-        """
-        Get the most recent options tick.
-
-        :param req:            The request type.
-        :param root:           The root symbol.
-        :param exp:            The expiration date.
-        :param strike:         The strike price in USD, rounded to 1/10th of a cent.
-        :param right:          The right of an options.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        root_fmt = root.lower()
-        req_fmt = req.name.lower()
-
-        url = f"http://{host}:{port}/snapshot/option/{req_fmt}"
-        querystring = {"root": root_fmt}
-        response = requests.get(url, params=querystring)
-        df = parse_flexible_REST(response)
-        return df
-
-    def get_req(
-        self,
-        req: str,
-    ) -> pd.DataFrame:
-        """
-        Make a historical data request given the raw text output of a data request. Typically used for debugging.
-
-        :param req:            The raw request.
-
-        :return:               The requested data as a pandas DataFrame.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
-        """
-        assert self._server is not None, _NOT_CONNECTED_MSG
-        # send request
-        req = req + "\n"
-        self._server.sendall(req.encode("utf-8"))
-
-        # parse response header
-        header_data = self._server.recv(20)
-        header: Header = Header.parse(req, header_data)
-
-        # parse response body
-        body_data = self._recv(header.size, progress_bar=False)
-        body: DataFrame = TickBody.parse(req, header, body_data)
-        return body
 

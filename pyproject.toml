@@ -24,7 +24,7 @@ dependencies = [
   "wget",
   "psutil",
   "ijson",
-  "requests",
+  "httpx",
 ]
 
 [project.optional-dependencies]
@@ -33,10 +33,16 @@ tests = [
   "pytest",
   "pytest-benchmark[histogram]>=3.2.1",
 ]
+
 docs = [
   "mkdocs",
   "mkdocstrings[python]",
   "mkdocs-material"
+]
+
+examples = [
+  "python-dotenv",
+  "jupyter",
 ]
 
 [project.urls]

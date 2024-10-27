@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import urllib
+from datetime import datetime, time as dt_time
 from urllib.parse import urlencode
 from urllib.request import urlopen
+from zoneinfo import ZoneInfo
 
 import ijson
 import time
@@ -90,6 +93,159 @@ class Header:
         )
 
 
+def parse_list(res: json, name: str, dates: bool = False) -> pd.Series:
+    """Parse REST response to pd.Series().
+    Convert dates from int to datetime if dates == True
+    Sort values when returning.
+
+    :param response: json object
+    :param dates: whether to parse the data as date objects. Format YYYYMMDD
+    :raises ResponseParseError: if parsing failed
+    """
+
+    header = res['header']
+    try:
+        lst = pd.Series(res['response'], name=name)
+        _check_header_errors_REST(header)
+
+        if dates:
+            try:
+                return pd.to_datetime(lst, format="%Y%m%d").sort_values()
+            except Exception as e:
+                logging.error(f"Failed to parse date for {name}. {e}")
+        else:
+            return lst.sort_values()
+    except Exception as e:
+        raise ResponseParseError(f'Failed to parse list for request: {name}. Please send this error to support. {e}')
+
+
+def parse_trade(res: json) -> pd.DataFrame:
+    """Parse REST response to pd.Series().
+    Convert dates from int to datetime if dates == True
+    Sort values when returning.
+
+    :param response: json object
+    :param dates: whether to parse the data as date objects. Format YYYYMMDD
+    :raises ResponseParseError: if parsing failed
+    """
+    # TODO convert ms_of_day
+    header = res['header']
+    cols = header['format']
+    try:
+        df = pd.DataFrame(res['response'], columns=cols)
+        if 'strike' in cols:
+            df['strike'] = df['strike'] / 1000
+
+        if 'expiration' in cols:
+            df['expiration'] = pd.to_datetime(df['expiration'], format="%Y%m%d")
+            df.set_index('expiration', inplace=True)
+
+        if {'date', 'ms_of_day'}.issubset(df.columns):
+            df['date'] = pd.to_datetime(df['date'], format="%Y%m%d")
+            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
+            df['trade_datetime'] = df.apply(
+                lambda row: datetime.combine(row['date'], row['ms_of_day']).replace(
+                    tzinfo=ZoneInfo("US/Eastern")
+                ),
+                axis=1
+            )
+            df.set_index('trade_datetime', inplace=True)
+
+        elif 'date' in cols:
+            df['date'] = pd.to_datetime(df['date'], format="%Y%m%d")
+            df.set_index('date', inplace=True)
+
+        elif 'ms_of_day' in cols:
+            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
+
+        _check_header_errors_REST(header)
+        return df
+
+    except Exception as e:
+        raise ResponseParseError(f'Failed to parse list for request. Please send this error to support. {e}')
+
+
+def parse_trade(res: json) -> pd.DataFrame:
+    """Parse REST response to pd.Series().
+    Convert dates from int to datetime if dates == True
+    Sort values when returning.
+
+    :param response: json object
+    :param dates: whether to parse the data as date objects. Format YYYYMMDD
+    :raises ResponseParseError: if parsing failed
+    """
+    # TODO convert ms_of_day
+    header = res['header']
+    cols = header['format']
+    try:
+        df = pd.DataFrame(res['response'], columns=cols)
+        if 'strike' in cols:
+            df['strike'] = df['strike'] / 1000
+
+        if 'expiration' in cols:
+            df['expiration'] = pd.to_datetime(df['expiration'], format="%Y%m%d")
+            df.set_index('expiration', inplace=True)
+
+        if {'date', 'ms_of_day'}.issubset(df.columns):
+            df['date'] = pd.to_datetime(df['date'], format="%Y%m%d")
+            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
+            df['trade_datetime'] = df.apply(
+                lambda row: datetime.combine(row['date'], row['ms_of_day']).replace(
+                    tzinfo=ZoneInfo("US/Eastern")
+                ),
+                axis=1
+            )
+            df.set_index('trade_datetime', inplace=True)
+
+        elif 'date' in cols:
+            df['date'] = pd.to_datetime(df['date'], format="%Y%m%d")
+            df.set_index('date', inplace=True)
+
+        elif 'ms_of_day' in cols:
+            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
+
+        _check_header_errors_REST(header)
+        return df
+
+    except Exception as e:
+        raise ResponseParseError(f'Failed to parse list for request. Please send this error to support. {e}')
+
+
+
+def ms_to_time(ms: int) -> time:
+    """Convert milliseconds since midnight to time object."""
+    try:
+        seconds = ms // 1000
+        microseconds = (ms % 1000) * 1000
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        seconds = seconds % 60
+        return dt_time(hour=hours, minute=minutes, second=seconds, microsecond=microseconds)
+    except Exception as e:
+        return dt_time(hour=0, minute=0, second=0, microsecond=0)
+        logging.error(f"Failed to convert milliseconds: {ms} to time. {e}")
+
+
+def time_to_ms(time_str):
+    # Split the time string by colons
+    parts = time_str.split(':')
+
+    if len(parts) == 3:  # H:M:S format
+        hours, minutes, seconds = map(int, parts)
+    elif len(parts) == 2:  # H:M format
+        hours, minutes = map(int, parts)
+        seconds = 0
+    else:
+        raise ValueError("Invalid time format. Use H:M:S or H:M")
+
+    # Convert to milliseconds
+    total_ms = (hours * 3600 + minutes * 60 + seconds) * 1000
+    logging.info(total_ms)
+    return total_ms
+
+
+########################## Not Touched ################################
+
 def parse_header_REST(response: requests.Response, header_string: str) -> dict:
     """Parse JSON header data into an object.
 
@@ -135,14 +291,16 @@ def _check_header_errors_REST(header: dict):
     :raises ResponseError: if the header indicates an error, containing a
                            helpful error message.
     """
-    if header["error_type"].lower() != "null":
-        msg = header["error_msg"]
-        if "no data" in msg.lower():
-            raise NoData(msg)
-        elif "disconnected" in msg.lower():
-            raise ReconnectingToServer(msg)
-        else:
-            raise ResponseError(msg)
+    error = header.get("error_type", None)
+    if error is not None:
+        if header.get("error_type").lower() != "null":
+            msg = header["error_msg"]
+            if "no data" in msg.lower():
+                raise NoData(msg)
+            elif "disconnected" in msg.lower():
+                raise ReconnectingToServer(msg)
+            else:
+                raise ResponseError(msg)
 
 
 # map price types to price multipliers
@@ -284,10 +442,11 @@ def parse_flexible_REST(response: requests.Response) -> pd.DataFrame:
     between json string and pandas dataframe.
     """
     response_dict = response.json()
-    _check_header_errors_REST(response_dict["header"])
+    _check_header_errors_REST(response["header"])
     cols = [DataType.from_string(name=col) for col in response_dict['header']['format']]
     rows = response_dict['response']
     df = pd.DataFrame(rows, columns=cols)
+    print(df)
     if DataType.DATE in df.columns:
         df[DataType.DATE] = pd.to_datetime(
             df[DataType.DATE], format="%Y%m%d"
@@ -423,22 +582,4 @@ class ListBody:
         return cls(lst=lst)
 
 
-def parse_list_REST(response: requests.Response, dates: bool = False) -> pd.Series:
-    """Parse binary body data into an object.
 
-    :param response: the requests.Response object
-    :param dates: whether to parse the data as date objects
-    :raises ResponseParseError: if parsing failed
-    """
-    df = pd.read_json(response.text, typ="series")
-    header = df['header']
-    _check_header_errors_REST(header)
-    try:
-        df = pd.Series(df['response'], copy=False)
-        if dates:
-            df = pd.to_datetime(df, format="%Y%m%d")
-        return df
-    except Exception as e:
-        raise ResponseParseError(
-            f"Failed to parse request: {response.url}. Please send this error to support."
-        ) from e

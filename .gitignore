@@ -1,3 +1,11 @@
+# added by dmckim1977
+# Environment variable files used by python-dotenv for client username and password
+*.env
+*.xml
+*.idea
+*.ics
+*.bat
+
 build/
 dist/
 venv/
