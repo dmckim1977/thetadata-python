@@ -3,28 +3,123 @@ from __future__ import annotations
 
 import json
 import logging
-import urllib
+import time
+from dataclasses import dataclass
 from datetime import datetime, time as dt_time
+from functools import wraps
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlencode
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
+import httpx
 import ijson
-import time
-from typing import Optional
-
-import requests
-from tqdm import tqdm
-
-from dataclasses import dataclass
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
 from pandas import DataFrame, Series
-from .exceptions import ResponseError, NoData, ResponseParseError, ReconnectingToServer
+
 from .enums import DataType, MessageType
+from .exceptions import NoData, ReconnectingToServer, ResponseError, \
+    ResponseParseError
 
 HEADER_MAX_LENGTH = 300  # max length of header in characters
-HEADER_FIELDS = ["id", "latency", "error_type", "error_msg", "next_page", "format"]
+HEADER_FIELDS = ["id", "latency", "error_type", "error_msg", "next_page",
+                 "format"]
+
+
+class DataHandler:
+    """Handles data retrieval, pagination, and parsing for ThetaClient."""
+
+    def __init__(self, url: str, parser: Callable):
+        """
+        Initialize the DataHandler.
+
+        Args:
+            base_url: Base URL for API requests
+            parser: Function to parse individual response pages
+        """
+        self.url = url
+        self.parser = parser
+
+    def get_paginated_data(
+            self,
+            url: str,
+            params: Dict[str, Any],
+            timeout: Optional[int] = None
+    ) -> pd.DataFrame:
+        """
+        Retrieve and combine all pages of data from the API.
+
+        Args:
+            url: API endpoint to query
+            params: Query parameters for initial request
+            timeout: Request timeout in seconds
+
+        Returns:
+            Combined DataFrame of all pages
+        """
+        url = url
+        dataframes = []
+        current_params = params
+        pages = 0
+
+        while True:
+            pages += 1
+            logging.info(f'Handling page {pages}')
+            print(f'Handling page {pages}')
+
+            # Make request for current page
+            response = httpx.get(
+                url,
+                params=current_params,
+                timeout=timeout
+            ).raise_for_status().json()
+
+            # Parse the current page
+            df = self.parser(response['header'])
+            dataframes.append(df)
+
+            # Check if there are more pages
+            print(response.get('header', {}))
+            next_page = response.get('header', {}).get('next_page')
+            if next_page == 'null' or not next_page:
+                break
+
+            # Update URL for next page and clear params
+            url = next_page
+            current_params = None
+
+        # Combine all dataframes
+        if len(dataframes) == 1:
+            return dataframes[0]
+
+        return pd.concat(dataframes, axis=0, ignore_index=True)
+
+
+def with_pagination(func):
+    """
+    Decorator to handle pagination for ThetaClient methods.
+
+    Automatically uses DataHandler to handle pagination for any client method
+    that returns paginated data.
+    """
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        # Get the endpoint and params from the decorated method
+        url, params = func(self, *args, **kwargs)
+
+        # Create DataHandler instance with appropriate parser
+        handler = DataHandler(
+            url=url,
+            parser=parse_trade
+        )
+
+        # Get paginated data
+        return handler.get_paginated_data(url, params)
+
+    return wrapper
 
 
 @dataclass
@@ -60,7 +155,7 @@ class Header:
         :param data: raw header data, 20 bytes long
         """
         assert (
-            len(data) == 20
+                len(data) == 20
         ), f"Cannot parse header with {len(data)} bytes. Expected 20 bytes."
         # avoid copying header data when slicing
         data = memoryview(data)
@@ -116,7 +211,9 @@ def parse_list(res: json, name: str, dates: bool = False) -> pd.Series:
         else:
             return lst.sort_values()
     except Exception as e:
-        raise ResponseParseError(f'Failed to parse list for request: {name}. Please send this error to support. {e}')
+        raise ResponseParseError(
+            f'Failed to parse list for request: {name}. '
+            f'Please send this error to support. {e}')
 
 
 def parse_trade(res: json) -> pd.DataFrame:
@@ -137,14 +234,16 @@ def parse_trade(res: json) -> pd.DataFrame:
             df['strike'] = df['strike'] / 1000
 
         if 'expiration' in cols:
-            df['expiration'] = pd.to_datetime(df['expiration'], format="%Y%m%d")
+            df['expiration'] = pd.to_datetime(df['expiration'],
+                                              format="%Y%m%d")
             df.set_index('expiration', inplace=True)
 
         if {'date', 'ms_of_day'}.issubset(df.columns):
             df['date'] = pd.to_datetime(df['date'], format="%Y%m%d")
             df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
             df['trade_datetime'] = df.apply(
-                lambda row: datetime.combine(row['date'], row['ms_of_day']).replace(
+                lambda row: datetime.combine(row['date'],
+                                             row['ms_of_day']).replace(
                     tzinfo=ZoneInfo("US/Eastern")
                 ),
                 axis=1
@@ -162,54 +261,8 @@ def parse_trade(res: json) -> pd.DataFrame:
         return df
 
     except Exception as e:
-        raise ResponseParseError(f'Failed to parse list for request. Please send this error to support. {e}')
-
-
-def parse_trade(res: json) -> pd.DataFrame:
-    """Parse REST response to pd.Series().
-    Convert dates from int to datetime if dates == True
-    Sort values when returning.
-
-    :param response: json object
-    :param dates: whether to parse the data as date objects. Format YYYYMMDD
-    :raises ResponseParseError: if parsing failed
-    """
-    # TODO convert ms_of_day
-    header = res['header']
-    cols = header['format']
-    try:
-        df = pd.DataFrame(res['response'], columns=cols)
-        if 'strike' in cols:
-            df['strike'] = df['strike'] / 1000
-
-        if 'expiration' in cols:
-            df['expiration'] = pd.to_datetime(df['expiration'], format="%Y%m%d")
-            df.set_index('expiration', inplace=True)
-
-        if {'date', 'ms_of_day'}.issubset(df.columns):
-            df['date'] = pd.to_datetime(df['date'], format="%Y%m%d")
-            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
-            df['trade_datetime'] = df.apply(
-                lambda row: datetime.combine(row['date'], row['ms_of_day']).replace(
-                    tzinfo=ZoneInfo("US/Eastern")
-                ),
-                axis=1
-            )
-            df.set_index('trade_datetime', inplace=True)
-
-        elif 'date' in cols:
-            df['date'] = pd.to_datetime(df['date'], format="%Y%m%d")
-            df.set_index('date', inplace=True)
-
-        elif 'ms_of_day' in cols:
-            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
-
-        _check_header_errors_REST(header)
-        return df
-
-    except Exception as e:
-        raise ResponseParseError(f'Failed to parse list for request. Please send this error to support. {e}')
-
+        raise ResponseParseError(
+            f'Failed to parse list for request. Please send this error to support. {e}')
 
 
 def ms_to_time(ms: int) -> time:
@@ -220,7 +273,8 @@ def ms_to_time(ms: int) -> time:
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
         seconds = seconds % 60
-        return dt_time(hour=hours, minute=minutes, second=seconds, microsecond=microseconds)
+        return dt_time(hour=hours, minute=minutes, second=seconds,
+                       microsecond=microseconds)
     except Exception as e:
         return dt_time(hour=0, minute=0, second=0, microsecond=0)
         logging.error(f"Failed to convert milliseconds: {ms} to time. {e}")
@@ -367,7 +421,7 @@ class TickBody:
     @classmethod
     def _parse(cls, header: Header, data: bytearray) -> TickBody:
         assert (
-            len(data) == header.size
+                len(data) == header.size
         ), f"Cannot parse body with {len(data)} bytes. Expected {header.size} bytes."
         n_cols = header.format_len
         n_ticks = int(header.size / (header.format_len * 4))
@@ -375,7 +429,7 @@ class TickBody:
         # parse format tick
         format: list[DataType] = []
         for ci in range(n_cols):
-            int_ = int.from_bytes(data[ci * 4 : ci * 4 + 4], "big")
+            int_ = int.from_bytes(data[ci * 4: ci * 4 + 4], "big")
             format.append(DataType.from_code(int_))
 
         # parse the rest of the ticks
@@ -443,7 +497,8 @@ def parse_flexible_REST(response: requests.Response) -> pd.DataFrame:
     """
     response_dict = response.json()
     _check_header_errors_REST(response["header"])
-    cols = [DataType.from_string(name=col) for col in response_dict['header']['format']]
+    cols = [DataType.from_string(name=col) for col in
+            response_dict['header']['format']]
     rows = response_dict['response']
     df = pd.DataFrame(rows, columns=cols)
     print(df)
@@ -509,7 +564,7 @@ def parse_hist_REST_stream_ijson(url, params) -> pd.DataFrame:
             _check_header_errors_REST(header)
             cols = [DataType.from_string(name=col) for col in header['format']]
             df = pd.DataFrame(columns=cols)
-            
+
     if DataType.DATE in df.columns:
         df[DataType.DATE] = pd.to_datetime(
             df[DataType.DATE], format="%Y%m%d"
@@ -547,7 +602,7 @@ class ListBody:
 
     @classmethod
     def parse(
-        cls, request: str, header: Header, data: bytes, dates: bool = False
+            cls, request: str, header: Header, data: bytes, dates: bool = False
     ) -> ListBody:
         """Parse binary body data into an object.
 
@@ -567,10 +622,10 @@ class ListBody:
 
     @classmethod
     def _parse(
-        cls, header: Header, data: bytes, dates: bool = False
+            cls, header: Header, data: bytes, dates: bool = False
     ) -> ListBody:
         assert (
-            len(data) == header.size
+                len(data) == header.size
         ), f"Cannot parse body with {len(data)} bytes. Expected {header.size} bytes."
 
         lst = data.decode("ascii").split(",")
@@ -580,6 +635,3 @@ class ListBody:
             lst = pd.to_datetime(lst, format="%Y%m%d")
 
         return cls(lst=lst)
-
-
-

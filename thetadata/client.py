@@ -2,22 +2,20 @@
 import logging
 import socket
 import threading
-import time
 import traceback
 from contextlib import contextmanager
-from datetime import time
 from threading import Thread
 from time import sleep
 from typing import Literal, Optional, get_args
 
 import httpx
 import pandas as pd
-from pandas import DataFrame
 from tqdm import tqdm
 
 from . import terminal
 from .enums import *
-from .parsing import (Header, TickBody, parse_flexible_REST, parse_list, parse_trade, time_to_ms)
+from .parsing import (parse_list, with_pagination,
+                      parse_trade, time_to_ms)
 from .terminal import check_download, launch_terminal
 
 _NOT_CONNECTED_MSG = "You must establish a connection first."
@@ -29,6 +27,8 @@ SecurityType = Literal["option", "stock", "index"]
 OptionReqType = Literal["quote", "trade", "implied_volatility"]
 OptionRight = Literal['C', 'P']
 Terminal = Literal['MDDS', 'FPSS']
+
+
 # endregion
 
 def is_security_type(value: str):  # TODO error checking here
@@ -57,8 +57,10 @@ def _format_date(dt: date) -> str:
 
 def ms_to_time(ms_of_day: int) -> datetime.time:
     """Converts milliseconds of day to a time object."""
-    return datetime(year=2000, month=1, day=1, hour=int((ms_of_day / (1000 * 60 * 60)) % 24),
-                    minute=int(ms_of_day / (1000 * 60)) % 60, second=int((ms_of_day / 1000) % 60),
+    return datetime(year=2000, month=1, day=1,
+                    hour=int((ms_of_day / (1000 * 60 * 60)) % 24),
+                    minute=int(ms_of_day / (1000 * 60)) % 60,
+                    second=int((ms_of_day / 1000) % 60),
                     microsecond=(ms_of_day % 1000) * 1000).time()
 
 
@@ -107,10 +109,13 @@ class Trade:
         self.sequence = parse_int(view[4:8]) & 0xffffffffffffffff
         self.size = parse_int(view[8:12])
         self.condition = TradeCondition.from_code(parse_int(view[12:16]))
-        self.price = round(parse_int(view[16:20]) * _pt_to_price_mul[parse_int(view[24:28])], 4)
+        self.price = round(
+            parse_int(view[16:20]) * _pt_to_price_mul[parse_int(view[24:28])],
+            4)
         self.exchange = Exchange.from_code(parse_int(view[20:24]))
         date_raw = str(parse_int(view[28:32]))
-        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
+        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]),
+                         day=int(date_raw[6:8]))
 
     def copy_from(self, other_trade):
         self.ms_of_day = other_trade.ms_of_day
@@ -123,8 +128,10 @@ class Trade:
 
     def to_string(self) -> str:
         """String representation of a trade."""
-        return 'ms_of_day: ' + str(self.ms_of_day) + ' sequence: ' + str(self.sequence) + ' size: ' + str(self.size) + \
-            ' condition: ' + str(self.condition.name) + ' price: ' + str(self.price) + ' exchange: ' + \
+        return 'ms_of_day: ' + str(self.ms_of_day) + ' sequence: ' + str(
+            self.sequence) + ' size: ' + str(self.size) + \
+            ' condition: ' + str(self.condition.name) + ' price: ' + str(
+                self.price) + ' exchange: ' + \
             str(self.exchange.value[1]) + ' date: ' + str(self.date)
 
 
@@ -147,14 +154,22 @@ class OHLCVC:
         view = memoryview(data)
         parse_int = lambda d: int.from_bytes(d, "big")
         self.ms_of_day = parse_int(view[0:4])
-        self.open = round(parse_int(view[4:8]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
-        self.high = round(parse_int(view[8:12]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
-        self.low = round(parse_int(view[12:16]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
-        self.close = round(parse_int(view[16:20]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
+        self.open = round(
+            parse_int(view[4:8]) * _pt_to_price_mul[parse_int(view[28:32])], 4)
+        self.high = round(
+            parse_int(view[8:12]) * _pt_to_price_mul[parse_int(view[28:32])],
+            4)
+        self.low = round(
+            parse_int(view[12:16]) * _pt_to_price_mul[parse_int(view[28:32])],
+            4)
+        self.close = round(
+            parse_int(view[16:20]) * _pt_to_price_mul[parse_int(view[28:32])],
+            4)
         self.volume = parse_int(view[20:24])
         self.count = parse_int(view[24:28])
         date_raw = str(parse_int(view[32:36]))
-        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
+        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]),
+                         day=int(date_raw[6:8]))
 
     def copy_from(self, other_ohlcvc):
         self.ms_of_day = other_ohlcvc.ms_of_day
@@ -168,8 +183,10 @@ class OHLCVC:
 
     def to_string(self) -> str:
         """String representation of a trade."""
-        return 'ms_of_day: ' + str(self.ms_of_day) + ' open: ' + str(self.open) + ' high: ' + str(self.high) + \
-            ' low: ' + str(self.low) + ' close: ' + str(self.close) + ' volume: ' + str(self.volume) + \
+        return 'ms_of_day: ' + str(self.ms_of_day) + ' open: ' + str(
+            self.open) + ' high: ' + str(self.high) + \
+            ' low: ' + str(self.low) + ' close: ' + str(
+                self.close) + ' volume: ' + str(self.volume) + \
             ' count: ' + str(self.count) + ' date: ' + str(self.date)
 
 
@@ -204,7 +221,8 @@ class Quote:
         self.ask_price = round(parse_int(view[28:32]) * mult, 4)
         self.ask_condition = QuoteCondition.from_code(parse_int(view[32:36]))
         date_raw = str(parse_int(view[40:44]))
-        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
+        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]),
+                         day=int(date_raw[6:8]))
 
     def copy_from(self, other_quote):
         self.ms_of_day = other_quote.ms_of_day
@@ -220,10 +238,14 @@ class Quote:
 
     def to_string(self) -> str:
         """String representation of a quote."""
-        return 'ms_of_day: ' + str(self.ms_of_day) + ' bid_size: ' + str(self.bid_size) + ' bid_exchange: ' + \
-            str(self.bid_exchange.value[1]) + ' bid_price: ' + str(self.bid_price) + ' bid_condition: ' + \
-            str(self.bid_condition.name) + ' ask_size: ' + str(self.ask_size) + ' ask_exchange: ' + \
-            str(self.ask_exchange.value[1]) + ' ask_price: ' + str(self.ask_price) + ' ask_condition: ' \
+        return 'ms_of_day: ' + str(self.ms_of_day) + ' bid_size: ' + str(
+            self.bid_size) + ' bid_exchange: ' + \
+            str(self.bid_exchange.value[1]) + ' bid_price: ' + str(
+                self.bid_price) + ' bid_condition: ' + \
+            str(self.bid_condition.name) + ' ask_size: ' + str(
+                self.ask_size) + ' ask_exchange: ' + \
+            str(self.ask_exchange.value[1]) + ' ask_price: ' + str(
+                self.ask_price) + ' ask_condition: ' \
             + str(self.ask_condition.name) + ' date: ' + str(self.date)
 
 
@@ -241,7 +263,8 @@ class OpenInterest:
         parse_int = lambda d: int.from_bytes(d, "big")
         self.open_interest = parse_int(view[0:4])
         date_raw = str(parse_int(view[4:8]))
-        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
+        self.date = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]),
+                         day=int(date_raw[6:8]))
 
     def copy_from(self, other_open_interest):
         self.open_interest = other_open_interest.open_interest
@@ -249,7 +272,8 @@ class OpenInterest:
 
     def to_string(self) -> str:
         """String representation of open interest."""
-        return 'open_interest: ' + str(self.open_interest) + ' date: ' + str(self.date)
+        return 'open_interest: ' + str(self.open_interest) + ' date: ' + str(
+            self.date)
 
 
 class Contract:
@@ -277,13 +301,15 @@ class Contract:
         if not self.isOption:
             return
         date_raw = str(parse_int(view[root_len + 3: root_len + 7]))
-        self.exp = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]), day=int(date_raw[6:8]))
+        self.exp = date(year=int(date_raw[0:4]), month=int(date_raw[4:6]),
+                        day=int(date_raw[6:8]))
         self.isCall = parse_int(view[root_len + 7: root_len + 8]) == 1
         self.strike = parse_int(view[root_len + 9: root_len + 13]) / 1000.0
 
     def to_string(self) -> str:
         """String representation of open interest."""
-        return 'root: ' + self.root + ' isOption: ' + str(self.isOption) + ' exp: ' + str(self.exp) + \
+        return 'root: ' + self.root + ' isOption: ' + str(
+            self.isOption) + ' exp: ' + str(self.exp) + \
             ' strike: ' + str(self.strike) + ' isCall: ' + str(self.isCall)
 
 
@@ -312,9 +338,12 @@ class ThetaClient:
     runs a java background process, which is responsible for the heavy lifting of market
     data communication. Java 11 or higher is required to use this class."""
 
-    def __init__(self, port: int = 25510, timeout: Optional[float] = 60, launch: bool = True, jvm_mem: int = 0,
-                 username: str = "default", passwd: str = "default", auto_update: bool = True, use_bundle: bool = True,
-                 host: str = "127.0.0.1", streaming_port: int = 10000, stable: bool = True):
+    def __init__(self, port: int = 25510, timeout: Optional[float] = 60,
+                 launch: bool = True, jvm_mem: int = 0,
+                 username: str = "default", passwd: str = "default",
+                 auto_update: bool = True, use_bundle: bool = True,
+                 host: str = "127.0.0.1", streaming_port: int = 10000,
+                 stable: bool = True):
         """Construct a client instance to interface with market data. If no username and passwd fields are provided,
             the terminal will connect to thetadata servers with free data permissions.
 
@@ -337,7 +366,8 @@ class ThetaClient:
         self.streaming_port: int = streaming_port
         self.timeout = timeout
         self._server: Optional[socket.socket] = None  # None while disconnected
-        self._stream_server: Optional[socket.socket] = None  # None while disconnected
+        self._stream_server: Optional[
+            socket.socket] = None  # None while disconnected
         self.launch = launch
         self._stream_impl = None
         self._stream_responses = {}
@@ -345,28 +375,31 @@ class ThetaClient:
         self._stream_req_id = 0
         self._stream_connected = False
 
-        print('If you require API support, feel free to join our discord server! http://discord.thetadata.us')
+        print(
+            'If you require API support, feel free to join our discord server! http://discord.thetadata.us')
         if launch:
             terminal.kill_existing_terminal()
             if username == "default" or passwd == "default":
                 print(
                     '------------------------------------------------------------------------------------------------')
-                print("You are using the free version of Theta Data. You are currently limited to "
-                      "20 requests / minute.\nA data subscription can be purchased at https://thetadata.net. "
-                      "If you already have a ThetaData\nsubscription, specify the username and passwd parameters.")
+                print(
+                    "You are using the free version of Theta Data. You are currently limited to "
+                    "20 requests / minute.\nA data subscription can be purchased at https://thetadata.net. "
+                    "If you already have a ThetaData\nsubscription, specify the username and passwd parameters.")
                 print(
                     '------------------------------------------------------------------------------------------------')
             if check_download(auto_update, stable):
-                Thread(target=launch_terminal, args=[username, passwd, use_bundle, jvm_mem, auto_update]).start()
+                Thread(target=launch_terminal,
+                       args=[username, passwd, use_bundle, jvm_mem,
+                             auto_update]).start()
         else:
             print(
                 "You are not launching the terminal. This means you should have an external instance already running.")
 
-
     # region ######################## TERMINAL ############################ # TODO Needs some more work
 
     @contextmanager
-    def connect(self): # TODO haven't touched yet
+    def connect(self):  # TODO haven't touched yet
         """Initiate a connection with the Theta Terminal. Requests can only be made inside this
             generator aka the `with client.connect()` block.
 
@@ -383,8 +416,9 @@ class ThetaClient:
                     break
                 except ConnectionError:
                     if i == 14:
-                        raise ConnectionError('Unable to connect to the local Theta Terminal process.'
-                                              ' Try restarting your system.')
+                        raise ConnectionError(
+                            'Unable to connect to the local Theta Terminal process.'
+                            ' Try restarting your system.')
                     sleep(1)
             self._server.settimeout(self.timeout)
             self._send_ver()
@@ -632,7 +666,8 @@ class ThetaClient:
             "rth": rth
         }
 
-        res = httpx.get(url, params=params, timeout=120).raise_for_status().json()
+        res = httpx.get(url, params=params,
+                        timeout=120).raise_for_status().json()
         df = parse_trade(res=res)
         return df
 
@@ -657,7 +692,8 @@ class ThetaClient:
             "rth": rth
         }
 
-        res = httpx.get(url, params=params, timeout=120).raise_for_status().json()
+        res = httpx.get(url, params=params,
+                        timeout=120).raise_for_status().json()
         df = parse_trade(res=res)
         return df
 
@@ -665,23 +701,23 @@ class ThetaClient:
 
     # region HISTORICAL DATA
     def historical_eod_report(
-        self,
-        start_date: int,
-        end_date: int,
-        exp: int,
-        right: OptionRight,
-        root: str,
-        strike: float) -> pd.DataFrame:
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            right: OptionRight,
+            root: str,
+            strike: float) -> pd.DataFrame:
 
         url = f"http://{self.host}:{self.port}/v2/hist/option/eod"
 
         params = {
-        "start_date": start_date,
-        "end_date": end_date,
-        "exp": exp,
-        "right": right,
-        "root": root,
-        "strike": strike,
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "right": right,
+            "root": root,
+            "strike": strike,
 
         }
 
@@ -861,29 +897,244 @@ class ThetaClient:
     # endregion
 
     # region HISTORICAL GREEKS
-    def historical_implied_volatility(self):
-        ...
+    @with_pagination
+    def historical_implied_volatility(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/hist/option/implied_volatility")
 
-    def historical_greeks(self):
-        ...
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+            "exclusive": exclusive,
+        }
 
-    def historical_greeks_second_order(self):
-        ...
+        # res = httpx.get(url, params=params).raise_for_status().json()
+        # df = parse_trade(res=res)
+        # return df
+        return url, params
 
-    def historical_greeks_third_order(self):
-        ...
+    def historical_greeks(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = f"http://{self.host}:{self.port}/v2/hist/option/greeks"
 
-    def historical_all_greeks(self):
-        ...
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+            "exclusive": exclusive,
+        }
 
-    def historical_trade_greeks(self):
-        ...
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
 
-    def historical_trade_greeks_second_order(self):
-        ...
+    def historical_greeks_second_order(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/hist/option/greeks_second_order")
 
-    def historical_trade_greeks_third_order(self):
-        ...
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+            "exclusive": exclusive,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_greeks_third_order(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/hist/option/greeks_third_order")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+            "exclusive": exclusive,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_all_greeks(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            rth: bool = False,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = f"http://{self.host}:{self.port}/v2/hist/option/all_greeks"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "rth": rth,
+            "exclusive": exclusive,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_trade_greeks(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            perf_boost: True,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = f"http://{self.host}:{self.port}/v2/hist/option/trade_greeks"
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "perf_boost": perf_boost,
+            "exclusive": exclusive,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_trade_greeks_second_order(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            perf_boost: True,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/hist/option/trade_greeks_second_order")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "perf_boost": perf_boost,
+            "exclusive": exclusive,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
+
+    def historical_trade_greeks_third_order(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            right: OptionRight,
+            root: str,
+            strike: float,
+            perf_boost: True,
+            exclusive: bool = True) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/hist/option/trade_greeks_third_order")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "perf_boost": perf_boost,
+            "exclusive": exclusive,
+        }
+
+        res = httpx.get(url, params=params).raise_for_status().json()
+        df = parse_trade(res=res)
+        return df
 
     # endregion
 
@@ -970,8 +1221,9 @@ class ThetaClient:
                 break
             except ConnectionError:
                 if i == 14:
-                    raise ConnectionError('Unable to connect to the local Theta Terminal Stream process. '
-                                          'Try restarting your system.')
+                    raise ConnectionError(
+                        'Unable to connect to the local Theta Terminal Stream process. '
+                        'Try restarting your system.')
                 sleep(1)
         self._stream_server.settimeout(10)
         self._stream_impl = callback
@@ -1013,7 +1265,8 @@ class ThetaClient:
         self._stream_server.sendall(hist_msg.encode("utf-8"))
         return req_id
 
-    def req_trade_stream_opt(self, root: str, exp: date = 0, strike: float = 0, right: OptionRight = 'C') -> int:
+    def req_trade_stream_opt(self, root: str, exp: date = 0, strike: float = 0,
+                             right: OptionRight = 'C') -> int:
         """from_bytes
           """
         assert self._stream_server is not None, _NOT_CONNECTED_MSG
@@ -1031,7 +1284,8 @@ class ThetaClient:
         self._stream_server.sendall(hist_msg.encode("utf-8"))
         return req_id
 
-    def req_quote_stream_opt(self, root: str, exp: date = 0, strike: float = 0, right: OptionRight = 'C') -> int:
+    def req_quote_stream_opt(self, root: str, exp: date = 0, strike: float = 0,
+                             right: OptionRight = 'C') -> int:
         """from_bytes
           """
         assert self._stream_server is not None, _NOT_CONNECTED_MSG
@@ -1079,7 +1333,8 @@ class ThetaClient:
         self._stream_server.sendall(hist_msg.encode("utf-8"))
         return req_id
 
-    def remove_trade_stream_opt(self, root: str, exp: date = 0, strike: float = 0, right: OptionRight = 'C'):
+    def remove_trade_stream_opt(self, root: str, exp: date = 0,
+                                strike: float = 0, right: OptionRight = 'C'):
         """from_bytes
           """
         assert self._stream_server is not None, _NOT_CONNECTED_MSG
@@ -1091,7 +1346,8 @@ class ThetaClient:
         hist_msg = f"MSG_CODE={MessageType.STREAM_REMOVE.value}&root={root}&exp={exp_fmt}&strike={strike}&right={right.value}&sec={SecType.OPTION.value}&req={OptionReqType.TRADE.value}&id={-1}\n"
         self._stream_server.sendall(hist_msg.encode("utf-8"))
 
-    def remove_quote_stream_opt(self, root: str, exp: date = 0, strike: float = 0, right: OptionRight = 'C'):
+    def remove_quote_stream_opt(self, root: str, exp: date = 0,
+                                strike: float = 0, right: OptionRight = 'C'):
         """from_bytes
           """
         assert self._stream_server is not None, _NOT_CONNECTED_MSG
@@ -1129,8 +1385,10 @@ class ThetaClient:
         self._stream_server.settimeout(10)
         while self._stream_connected:
             try:
-                msg.type = StreamMsgType.from_code(parse_int(self._read_stream(1)[:1]))
-                msg.contract.from_bytes(self._read_stream(parse_int(self._read_stream(1)[:1])))
+                msg.type = StreamMsgType.from_code(
+                    parse_int(self._read_stream(1)[:1]))
+                msg.contract.from_bytes(
+                    self._read_stream(parse_int(self._read_stream(1)[:1])))
                 if msg.type == StreamMsgType.QUOTE:
                     msg.quote.from_bytes(self._read_stream(44))
                 elif msg.type == StreamMsgType.TRADE:
@@ -1146,10 +1404,13 @@ class ThetaClient:
                     msg.open_interest.from_bytes(data)
                 elif msg.type == StreamMsgType.REQ_RESPONSE:
                     msg.req_response_id = parse_int(self._read_stream(4))
-                    msg.req_response = StreamResponseType.from_code(parse_int(self._read_stream(4)))
-                    self._stream_responses[msg.req_response_id] = msg.req_response
+                    msg.req_response = StreamResponseType.from_code(
+                        parse_int(self._read_stream(4)))
+                    self._stream_responses[
+                        msg.req_response_id] = msg.req_response
                 elif msg.type == StreamMsgType.STOP or msg.type == StreamMsgType.START:
-                    msg.date = datetime.strptime(str(parse_int(self._read_stream(4))), "%Y%m%d").date()
+                    msg.date = datetime.strptime(
+                        str(parse_int(self._read_stream(4))), "%Y%m%d").date()
                 elif msg.type == StreamMsgType.DISCONNECTED or msg.type == StreamMsgType.RECONNECTED:
                     self._read_stream(4)  # Future use.
                 else:
@@ -1217,5 +1478,3 @@ class ThetaClient:
         return buffer
 
     # endregion
-
-
