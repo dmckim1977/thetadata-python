@@ -1,12 +1,16 @@
 """Module that contains Theta Client class."""
 import logging
+import os
+import shutil
 import socket
+import subprocess
 import threading
 import traceback
 from contextlib import contextmanager
+from pathlib import Path
 from threading import Thread
 from time import sleep
-from typing import Literal, Optional, get_args
+from typing import Optional, get_args
 
 import httpx
 import pandas as pd
@@ -14,54 +18,26 @@ from tqdm import tqdm
 
 from . import terminal
 from .enums import *
-from .parsing import (parse_list, with_pagination,
-                      parse_trade, time_to_ms)
+from .literals import Rate, SecurityType, Terminal
+from .parsing import (
+    get_paginated_csv_dataframe,
+    get_paginated_dataframe_request,
+    parse_list,
+    parse_trade
+)
 from .terminal import check_download, launch_terminal
+from .utils import _format_date, _format_strike, time_to_ms
 
 _NOT_CONNECTED_MSG = "You must establish a connection first."
 _VERSION = '0.9.11'
 URL_BASE = "http://127.0.0.1:25510/"
 
-# region Define Literals # TODO move to another module
-SecurityType = Literal["option", "stock", "index"]
-OptionReqType = Literal["quote", "trade", "implied_volatility"]
-OptionRight = Literal['C', 'P']
-Terminal = Literal['MDDS', 'FPSS']
+jdk_path = Path.home().joinpath('ThetaData').joinpath('ThetaTerminal') \
+    .joinpath('jdk-19.0.1').joinpath('bin')
 
+to_extract = Path.home().joinpath('ThetaData').joinpath('ThetaTerminal')
 
-# endregion
-
-def is_security_type(value: str):  # TODO error checking here
-    return value in get_args(SecurityType)
-
-
-def is_right(value: str):  # TODO error checking here
-    return value in get_args(OptionRight)
-
-
-def is_option_req(value: str):  # TODO error checking here
-    return value in get_args(OptionReqType)
-
-
-# endregion
-
-def _format_strike(strike: float) -> int:
-    """Round USD to the nearest tenth of a cent, acceptable by the terminal."""
-    return round(strike * 1000)
-
-
-def _format_date(dt: date) -> str:
-    """Format a date obj into a string acceptable by the terminal."""
-    return dt.strftime("%Y%m%d")
-
-
-def ms_to_time(ms_of_day: int) -> datetime.time:
-    """Converts milliseconds of day to a time object."""
-    return datetime(year=2000, month=1, day=1,
-                    hour=int((ms_of_day / (1000 * 60 * 60)) % 24),
-                    minute=int(ms_of_day / (1000 * 60)) % 60,
-                    second=int((ms_of_day / 1000) % 60),
-                    microsecond=(ms_of_day % 1000) * 1000).time()
+_thetadata_jar = "ThetaTerminal.jar"
 
 
 _pt_to_price_mul = [
@@ -334,35 +310,61 @@ def is_security_type(literal: str):
 
 
 class ThetaClient:
-    """A high-level, blocking client used to fetch market data. Instantiating this class
-    runs a java background process, which is responsible for the heavy lifting of market
-    data communication. Java 11 or higher is required to use this class."""
+    """A high-level, blocking client used to fetch market data.
 
-    def __init__(self, port: int = 25510, timeout: Optional[float] = 60,
-                 launch: bool = True, jvm_mem: int = 0,
-                 username: str = "default", passwd: str = "default",
-                 auto_update: bool = True, use_bundle: bool = True,
-                 host: str = "127.0.0.1", streaming_port: int = 10000,
-                 stable: bool = True):
-        """Construct a client instance to interface with market data. If no username and passwd fields are provided,
-            the terminal will connect to thetadata servers with free data permissions.
+    Instantiating this class runs a java background process, which is
+    responsible for the heavy lifting of market data communication.
+    Java 11 or higher is required to use this class.
 
-        :param port: The port number specified in the Theta Terminal config, which can usually be found under
-                        %user.home%/ThetaData/ThetaTerminal.
+    """
+
+    def __init__(
+            self,
+            port: int = 25510,
+            timeout: Optional[float] = 60,
+            launch: bool = True,
+            jvm_mem: int = 0,
+            username: str = "default",
+            passwd: str = "default",
+            thetadata_jar = _thetadata_jar,
+            auto_update: bool = True,
+            use_bundle: bool = True,
+            host: str = "127.0.0.1",
+            streaming_port: int = 10000,
+            move_jar: bool = True,
+            stable: bool = True):
+        """Construct a client instance to interface with market data.
+
+        If no username and passwd fields are provided, the terminal will
+        connect to thetadata servers with free data permissions.
+
+        :param port: The port number specified in the Theta Terminal config,
+            which can usually be found under
+            %user.home%/ThetaData/ThetaTerminal.
         :param streaming_port: The port number of Theta Terminal Stream server
         :param host: The host name or IP address of Theta Terminal server
-        :param timeout: The max number of seconds to wait for a response before throwing a TimeoutError
-        :param launch: Launches the terminal if true; uses an existing external terminal instance if false.
-        :param jvm_mem: Any integer provided above zero will force the terminal to allocate a maximum amount of memory in GB.
-        :param username: Theta Data email. Can be omitted with passwd if using free data.
-        :param passwd: Theta Data password. Can be omitted with username if using free data.
-        :param auto_update: If true, this class will automatically download the latest terminal version each time
-            this class is instantiated. If false, the terminal will use the current jar terminal file. If none exists,
-            it will download the latest version.
-        :param use_bundle: Will download / use open-jdk-19.0.1 if True and the operating system is windows.
+        :param timeout: The max number of seconds to wait for a response
+            before throwing a TimeoutError
+        :param launch: Launches the terminal if true; uses an existing
+            external terminal instance if false.
+        :param jvm_mem: Any integer provided above zero will force the
+            terminal to allocate a maximum amount of memory in GB.
+        :param username: Theta Data email. Can be omitted with passwd if
+            using free data.
+        :param passwd: Theta Data password. Can be omitted with username
+            if using free data.
+        :param auto_update: If true, this class will automatically download
+            the latest terminal version each time this class is instantiated.
+            If false, the terminal will use the current jar terminal file.
+            If none exists, it will download the latest version.
+        :param use_bundle: Will download / use open-jdk-19.0.1 if True and
+            the operating system is windows.
+
         """
         self.host: str = host
         self.port: int = port
+        self.username = username,
+        self.passwd = passwd
         self.streaming_port: int = streaming_port
         self.timeout = timeout
         self._server: Optional[socket.socket] = None  # None while disconnected
@@ -374,57 +376,37 @@ class ThetaClient:
         self._counter_lock = threading.Lock()
         self._stream_req_id = 0
         self._stream_connected = False
+        self._thetadata_jar = thetadata_jar,
+        self.jvm_mem = jvm_mem,
+        self.use_bundle = use_bundle,
+        self.move_jar = move_jar,
+        self.auto_update = auto_update,
+        self.stable = stable,
 
-        print(
-            'If you require API support, feel free to join our discord server! http://discord.thetadata.us')
+
+        logging.info(
+            'If you require API support, feel free to join our discord server!'
+            'http://discord.thetadata.us')
         if launch:
             terminal.kill_existing_terminal()
             if username == "default" or passwd == "default":
-                print(
-                    '------------------------------------------------------------------------------------------------')
-                print(
-                    "You are using the free version of Theta Data. You are currently limited to "
-                    "20 requests / minute.\nA data subscription can be purchased at https://thetadata.net. "
-                    "If you already have a ThetaData\nsubscription, specify the username and passwd parameters.")
-                print(
-                    '------------------------------------------------------------------------------------------------')
+                logging.warning("You are using the free version of Theta Data."
+                                " You are currently limited to 20 requests / "
+                                "minute.A data subscription can be purchased "
+                                "at https://thetadata.net. If you already have"
+                                " a ThetaData subscription, specify the "
+                                "username and passwd parameters.")
+
             if check_download(auto_update, stable):
                 Thread(target=launch_terminal,
                        args=[username, passwd, use_bundle, jvm_mem,
                              auto_update]).start()
         else:
             print(
-                "You are not launching the terminal. This means you should have an external instance already running.")
+                "You are not launching the terminal. This means you should "
+                "have an external instance already running.")
 
-    # region ######################## TERMINAL ############################ # TODO Needs some more work
-
-    @contextmanager
-    def connect(self):  # TODO haven't touched yet
-        """Initiate a connection with the Theta Terminal. Requests can only be made inside this
-            generator aka the `with client.connect()` block.
-
-        :raises ConnectionRefusedError: If the connection failed.
-        :raises TimeoutError: If the timeout is set and has been reached.
-        """
-
-        try:
-            for i in range(15):
-                try:
-                    self._server = socket.socket()
-                    self._server.connect((self.host, self.port))
-                    self._server.settimeout(1)
-                    break
-                except ConnectionError:
-                    if i == 14:
-                        raise ConnectionError(
-                            'Unable to connect to the local Theta Terminal process.'
-                            ' Try restarting your system.')
-                    sleep(1)
-            self._server.settimeout(self.timeout)
-            self._send_ver()
-            yield
-        finally:
-            self._server.close()
+    # region  TERMINAL  # TODO add connection manager
 
     def status(self, service: Optional[Terminal] = 'mdds'):
 
@@ -434,6 +416,7 @@ class ThetaClient:
         try:
             res = httpx.get(url, headers=headers).raise_for_status()
             logging.info(res.text)
+            return True
 
         except httpx.HTTPError as exc:
             logging.error(f'Could not get {service} status. Error: {exc}')
@@ -441,14 +424,14 @@ class ThetaClient:
             logging.error(f'Could not get {service} status. Error: {e}')
 
     def kill(self, ignore_err=True) -> None:
-        """Remotely kill the Terminal process. All subsequent requests will time out after this. A new instance of this
-           class must be created.
+        """Remotely kill the Terminal process. All subsequent requests will
+        time out after this. A new instance of this class must be created.
 
         """
         try:
             url = f"http://{self.host}:{self.port}/v2/system/terminal/shutdown"
             res = httpx.get(url).raise_for_status()
-            logging.error(res.text)
+            logging.info(res.text)
         except Exception as e:
             logging.error(f'Could not close terminal. error: {e}')
 
@@ -579,9 +562,8 @@ class ThetaClient:
 
         params = {"root": root, "start_date": start_date}
         url = f"http://{self.host}:{self.port}/v2/list/contracts/option/{req}"
-        res = httpx.get(url, params=params).raise_for_status().json()
-        cars = parse_trade(res=res)
-        return cars
+
+        return get_paginated_dataframe_request(url, params)
 
     # endregion
 
@@ -610,9 +592,7 @@ class ThetaClient:
             "rth": rth
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_dataframe_request(url, params)
 
     def trade_at_time(
             self,
@@ -638,9 +618,7 @@ class ThetaClient:
             "rth": rth
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_dataframe_request(url, params)
 
     # endregion
 
@@ -666,10 +644,7 @@ class ThetaClient:
             "rth": rth
         }
 
-        res = httpx.get(url, params=params,
-                        timeout=120).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_dataframe_request(url, params)
 
     # TODO empty dataframe. Check later
     def bulk_trade_at_time(
@@ -897,7 +872,6 @@ class ThetaClient:
     # endregion
 
     # region HISTORICAL GREEKS
-    @with_pagination
     def historical_implied_volatility(
             self,
             start_date: int,
@@ -922,12 +896,11 @@ class ThetaClient:
             "strike": strike,
             "rth": rth,
             "exclusive": exclusive,
+            "use_csv": True,
         }
 
-        # res = httpx.get(url, params=params).raise_for_status().json()
-        # df = parse_trade(res=res)
-        # return df
-        return url, params
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     def historical_greeks(
             self,
@@ -952,11 +925,11 @@ class ThetaClient:
             "strike": strike,
             "rth": rth,
             "exclusive": exclusive,
+            "use_csv": True,
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     def historical_greeks_second_order(
             self,
@@ -982,11 +955,11 @@ class ThetaClient:
             "strike": strike,
             "rth": rth,
             "exclusive": exclusive,
+            "use_csv": True,
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     def historical_greeks_third_order(
             self,
@@ -1012,11 +985,11 @@ class ThetaClient:
             "strike": strike,
             "rth": rth,
             "exclusive": exclusive,
+            "use_csv": True
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     def historical_all_greeks(
             self,
@@ -1041,11 +1014,11 @@ class ThetaClient:
             "strike": strike,
             "rth": rth,
             "exclusive": exclusive,
+            "use_csv": True
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     def historical_trade_greeks(
             self,
@@ -1070,11 +1043,11 @@ class ThetaClient:
             "strike": strike,
             "perf_boost": perf_boost,
             "exclusive": exclusive,
+            "use_csv": True,
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     def historical_trade_greeks_second_order(
             self,
@@ -1100,11 +1073,11 @@ class ThetaClient:
             "strike": strike,
             "perf_boost": perf_boost,
             "exclusive": exclusive,
+            "use_csv": True,
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     def historical_trade_greeks_third_order(
             self,
@@ -1130,27 +1103,480 @@ class ThetaClient:
             "strike": strike,
             "perf_boost": perf_boost,
             "exclusive": exclusive,
+            "use_csv": True,
         }
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     # endregion
 
     # region BULK HISTORICAL DATA
 
+    def bulk_historical_data_bulk_eod(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            root: str,
+            annual_div: Optional[float] = None,
+            rate: Optional[Rate] = None,
+            rate_value: Optional[float] = None,
+            under_price: Optional[float] = None,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/eod")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "root": root,
+            "annual_div": annual_div,
+            "rate": rate,
+            "rate_value": rate_value,
+            "under_price": under_price,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_historical_data_bulk_quote(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            root: str,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/quote")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "root": root,
+            "start_time": start_time,
+            "end_time": end_time,
+            "use_csv": True,
+        }
+
+        if start_time:
+            params["start_time"] = time_to_ms(start_time)
+        if start_time:
+            params["end_time"] = time_to_ms(end_time)
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_historical_data_bulk_ohlc(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            ivl: int,
+            root: str,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/ohlc")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "ivl": ivl,
+            "root": root,
+            "start_time": start_time,
+            "end_time": end_time,
+            "use_csv": True,
+        }
+
+        if start_time:
+            params["start_time"] = time_to_ms(start_time)
+        if start_time:
+            params["end_time"] = time_to_ms(end_time)
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_historical_data_bulk_open_interest(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            root: str,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/open_interest")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "root": root,
+            "use_csv": True,
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_historical_data_bulk_trade(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            root: str,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/trade")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "root": root,
+            "use_csv": True,
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_historical_data_bulk_trade_quote(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            root: str,
+            exclusive: Optional[bool] = True,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/trade_quote")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "root": root,
+            "exclusive": exclusive,
+            "use_csv": True,
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_historical_data_bulk_eod_greeks(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            root: str,
+            annual_div: Optional[float] = None,
+            rate: Optional[Rate] = None,
+            rate_value: Optional[float] = None,
+            under_price: Optional[float] = None,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/eod_greeks")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "root": root,
+            "annual_div": annual_div,
+            "rate": rate,
+            "rate_value": rate_value,
+            "under_price": under_price,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_historical_data_bulk_all_greeks(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            root: str,
+            ivl: int,
+            annual_div: Optional[float] = None,
+            rate: Optional[Rate] = None,
+            rate_value: Optional[float] = None,
+            under_price: Optional[float] = None,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/all_greeks")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "root": root,
+            "ivl": ivl,
+            "annual_div": annual_div,
+            "rate": rate,
+            "rate_value": rate_value,
+            "under_price": under_price,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
     # endregion
 
     # region BULK HISTORICAL GREEKS
+
+    def bulk_historical_greeks_bulk_trade_greeks(
+            self,
+            start_date: int,
+            end_date: int,
+            exp: int,
+            root: str,
+            ivl: int,
+            perf_boost: Optional[bool] = True,
+            annual_div: Optional[float] = None,
+            rate: Optional[Rate] = None,
+            rate_value: Optional[float] = None,
+            under_price: Optional[float] = None,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_hist/option/trade_greeks")
+
+        params = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "exp": exp,
+            "root": root,
+            "ivl": ivl,
+            "perf_boost": perf_boost,
+            "annual_div": annual_div,
+            "rate": rate,
+            "rate_value": rate_value,
+            "under_price": under_price,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     # endregion
 
     # region SNAPSHOTS
 
+    def snapshots_quotes(
+            self,
+            exp: int,
+            right: OptionRight,
+            root: str,
+            strike: float) -> pd.DataFrame:
+        url = f"http://{self.host}:{self.port}/v2/snapshot/option/quote"
+
+        params = {
+            "exp": exp,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def snapshots_ohlc(
+            self,
+            exp: int,
+            right: OptionRight,
+            root: str,
+            strike: float) -> pd.DataFrame:
+        url = f"http://{self.host}:{self.port}/v2/snapshot/option/ohlc"
+
+        params = {
+            "exp": exp,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def snapshots_trade(
+            self,
+            exp: int,
+            right: OptionRight,
+            root: str,
+            strike: float) -> pd.DataFrame:
+        url = f"http://{self.host}:{self.port}/v2/snapshot/option/trade"
+
+        params = {
+            "exp": exp,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def snapshots_open_interest(
+            self,
+            exp: int,
+            right: OptionRight,
+            root: str,
+            strike: float) -> pd.DataFrame:
+        url = f"http://{self.host}:{self.port}/v2/snapshot/option/open_interest"
+
+        params = {
+            "exp": exp,
+            "right": right,
+            "root": root,
+            "strike": strike,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
     # endregion
 
     # region BULK SNAPSHOTS
+
+    def bulk_snapshots_bulk_quotes(
+            self,
+            exp: int,
+            root: str,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_snapshot/option/quote")
+
+        params = {
+            "exp": exp,
+            "root": root,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_snapshots_bulk_open_interest(
+            self,
+            exp: int,
+            root: str,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_snapshot/option/open_interest")
+
+        params = {
+            "exp": exp,
+            "root": root,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_snapshots_bulk_ohlc(
+            self,
+            exp: int,
+            root: str,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_snapshot/option/ohlc")
+
+        params = {
+            "exp": exp,
+            "root": root,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_snapshots_bulk_greeks(
+            self,
+            exp: int,
+            root: str,
+            annual_div: Optional[float] = None,
+            rate: Optional[Rate] = None,
+            rate_value: Optional[float] = None,
+            under_price: Optional[float] = None,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_snapshot/option/greeks")
+
+        params = {
+            "exp": exp,
+            "root": root,
+            "annual_div": annual_div,
+            "rate": rate,
+            "rate_value": rate_value,
+            "under_price": under_price,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_snapshots_bulk_greeks_second_order(
+            self,
+            exp: int,
+            root: str,
+            annual_div: Optional[float] = None,
+            rate: Optional[Rate] = None,
+            rate_value: Optional[float] = None,
+            under_price: Optional[float] = None,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_snapshot/option/greeks_second_order")
+
+        params = {
+            "exp": exp,
+            "root": root,
+            "annual_div": annual_div,
+            "rate": rate,
+            "rate_value": rate_value,
+            "under_price": under_price,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
+
+    def bulk_snapshots_bulk_greeks_third_order(
+            self,
+            exp: int,
+            root: str,
+            annual_div: Optional[float] = None,
+            rate: Optional[Rate] = None,
+            rate_value: Optional[float] = None,
+            under_price: Optional[float] = None,
+    ) -> pd.DataFrame:
+        url = (f"http://{self.host}:{self.port}"
+               f"/v2/bulk_snapshot/option/greeks_third_order")
+
+        params = {
+            "exp": exp,
+            "root": root,
+            "annual_div": annual_div,
+            "rate": rate,
+            "rate_value": rate_value,
+            "under_price": under_price,
+            "use_csv": True
+        }
+
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     # endregion
 

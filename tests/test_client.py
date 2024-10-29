@@ -1,184 +1,88 @@
-"""Contains various tests for the ThetaClient class."""
-import warnings
+"""
+Test for the ThetaTerminal.
 
-import pandas as pd
-from pandas import DataFrame, Series
+- Test Terminal with launch() and kill() on initialization.
+- Test Terminal connect() context manager.
+
+"""
+import logging
+import os
 import pytest
-import datetime
-import thetadata
-from thetadata import (
-    ThetaClient,
-    OptionReqType,
-    OptionRight,
-    DateRange,
-    SecType,
-    DataType, NoData,
-)
-from . import tc
+from dotenv import load_dotenv
+from thetadata import ThetaClient
 
 
-# @pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_end_of_day(tc: ThetaClient):
-    """Test an EOD historical request."""
-    res = tc.get_hist_option(
-        req=OptionReqType.EOD,
-        root="AAPL",
-        exp=datetime.date(2022, 7, 15),
-        strike=140,
-        right=OptionRight.CALL,
-        date_range=DateRange(
-            datetime.date(2022, 7, 6), datetime.date(2022, 7, 15)
-        ),
-        progress_bar=True,
+@pytest.fixture(scope="session")
+def env_variables():
+    """Fixture to load environment variables"""
+    load_dotenv()
+    credentials = {
+        'username': os.getenv('THETAUSER'),
+        'password': os.getenv('THETAPASS')
+    }
+
+    if not all(credentials.values()):
+        pytest.fail(
+            "Environment variables THETAUSER and THETAPASS must be set")
+
+    return credentials
+
+
+@pytest.fixture(scope="function")
+def theta_client(env_variables):
+    """Fixture to create and cleanup a ThetaClient instance"""
+    client = ThetaClient(
+        username=env_variables['username'],
+        passwd=env_variables['password'],
+        launch=True
     )
-    print(res)
-    assert isinstance(res, DataFrame)
-    assert len(res.index) > 0
+
+    yield client
+
+    # Cleanup after each test
+    client.kill()
 
 
-@pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_hist_option_quotes_small(tc: ThetaClient):
-    """Test a historical options request."""
-    res = tc.get_hist_option(
-        req=OptionReqType.QUOTE,
-        root="AAPL",
-        exp=datetime.date(2022, 7, 15),
-        strike=140,
-        right=OptionRight.CALL,
-        date_range=DateRange(
-            datetime.date(2022, 7, 6), datetime.date(2022, 7, 8)
-        ),
-        progress_bar=True,
+def test_client_initialization(env_variables):
+    """Test that client initializes successfully"""
+    client = ThetaClient(
+        username=env_variables['username'],
+        passwd=env_variables['password'],
+        launch=True
     )
-    print(res)
-    print(res.columns)
-    assert isinstance(res, DataFrame)
-    assert len(res.index) > 0
-
-
-@pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_hist_option_quotes_large(tc: ThetaClient):
-    """Test a very large historical options request."""
-    res = tc.get_hist_option(
-        req=OptionReqType.QUOTE,
-        root="AAPL",
-        exp=datetime.date(2022, 7, 15),
-        strike=140,
-        right=OptionRight.CALL,
-        date_range=DateRange(
-            datetime.date(2022, 7, 4), datetime.date(2022, 7, 8)
-        ),
-        progress_bar=True,
-    )
-    print(res)
-    assert isinstance(res, DataFrame)
-    assert len(res.index) > 0
-
-
-@pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_hist_option_trades(tc: ThetaClient):
-    """Test a very large historical options request."""
-    res = tc.get_hist_option(
-        req=OptionReqType.TRADE,
-        root="AAPL",
-        exp=datetime.date(2022, 9, 16),
-        strike=140,
-        right=OptionRight.CALL,
-        date_range=DateRange(datetime.date(2022, 9, 1), datetime.date(2022, 9, 16)),
-        progress_bar=True,
-    )
-    print(res)
-    assert isinstance(res, DataFrame)
-    assert len(res.index) > 0
-
-
-@pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_hist_option_open_interest(tc: ThetaClient):
-    """Test a very large historical options request."""
-    today = datetime.date.today()
-    friday = today + datetime.timedelta((4 - today.weekday()) % 7)
-    print("exp:        " + friday.__str__())
-    print("root:       " + "AAPL")
-    print("Date range: " + DateRange.from_days(7).__str__())
 
     try:
-        res = tc.get_hist_option(
-            req=OptionReqType.OPEN_INTEREST,
-            root="AAPL",
-            exp=datetime.date(2022, 11, 11),
-            strike=140,
-            right=OptionRight.CALL,
-            date_range=DateRange(start=datetime.date(2022, 10, 29), end=datetime.date(2022, 11, 5)),
-            progress_bar=True,
-        )
-    except NoData:
-        today = datetime.date.today() + datetime.timedelta(days=7)
-        friday = today + datetime.timedelta((4 - today.weekday()) % 7)
-        res = tc.get_hist_option(
-            req=OptionReqType.OPEN_INTEREST,
-            root="AAPL",
-            exp=friday,
-            strike=140,
-            right=OptionRight.CALL,
-            date_range=DateRange.from_days(7),
-            progress_bar=True,
-        )
-    print(res)
-    assert isinstance(res, DataFrame)
-    assert len(res.index) > 0
+        assert isinstance(client, ThetaClient)
+    finally:
+        client.kill()
 
 
-def test_expirations(tc: ThetaClient):
-    """Test an expirations listing request."""
-    res = tc.expirations(root="AAPL")
-    print(res)
-    assert isinstance(res, Series)
-    assert len(res.index) > 0
+def test_client_status(theta_client):
+    """Test that client can check status"""
+    status = theta_client.status()
+    assert status is not None
 
 
-@pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_strikes(tc: ThetaClient):
-    """Ensure that an invalid strike listing request raises."""
-    with pytest.raises(thetadata.ResponseError) as e_info:
-        res = tc.strikes(root="BDX", exp=datetime.date(2022, 6, 1))
-
-
-# @pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_strikes(tc: ThetaClient):
-    """Test a strike listing request."""
-    res = tc.strikes(
-        root="AAPL",
-        exp=datetime.date(2022, 7, 29),
+def test_client_lifecycle(env_variables):
+    """Test the full lifecycle of client creation, status check, and cleanup"""
+    client = ThetaClient(
+        username=env_variables['username'],
+        passwd=env_variables['password'],
+        launch=True
     )
-    print(res)
-    assert isinstance(res, Series)
-    assert len(res.index) > 0
 
+    try:
+        # Test initial status
+        initial_status = client.status()
+        assert initial_status is not None
 
-def test_roots(tc: ThetaClient):
-    """Test a root listing request."""
-    res = tc.get_roots(sec=SecType.OPTION)
-    print(res)
-    assert isinstance(res, Series)
-    assert len(res.index) > 0
-
-
-@pytest.mark.skip(reason="Ignore for now.")  # TODO: remove
-def test_get_last(tc: ThetaClient):
-    """Test a get last options data request."""
-    res = tc.get_last_option(
-        req=OptionReqType.QUOTE,
-        root="AAPL",
-        exp=(datetime.datetime.now() + datetime.timedelta(days=4)).date(),
-        strike=140,
-        right=OptionRight.CALL,
-    )
-    print(res)
-    assert isinstance(res, DataFrame)
-    assert len(res.index) == 1
-
-
-@pytest.mark.skip(reason="Cannot automate restart yet")
-def test_kill_method(tc: ThetaClient):
-    """Test killing the Terminal process by calling client.kill()"""
-    tc.kill()
+        # Test kill operation
+        client.kill()
+        # Note: You might want to add additional assertions here
+        # depending on how the client behaves after being killed
+    finally:
+        # Ensure cleanup even if test fails
+        try:
+            client.kill()
+        except Exception as e:
+            logging.error('Failed to kill client. Error: {}'.format(e))

@@ -112,14 +112,15 @@ def check_download(auto_update: bool, stable: bool) -> bool:
                     output.write(jar.read())
                     output.close()
         except:
-            print('Unable to fetch the latest terminal version. Please contact support.')
+            print('Unable to fetch the latest terminal version. '
+                  'Please contact support.')
     return False
 
 
 def kill_existing_terminal() -> None:
-    """
-    Utility function to kill any ThetaData terminal processes by scanning all running proceeses
-    and killing such process
+    """Utility function to kill any ThetaData terminal processes by
+    scanning all running proceeses and killing such process
+
     """
     for pid in psutil.pids():
         try:
