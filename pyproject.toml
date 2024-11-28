@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "thetadata"
+version = "0.9.13"
+description = "A wrapper around Thetadata's api."
+authors = ["David Mckim <davidmckim@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+pydantic = "^2.10.2"
+pandas = "^2.2.3"
+httpx = "^0.27.2"
+tenacity = "^9.0.0"
+
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.8.0"
+pytest = "^8.3.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
