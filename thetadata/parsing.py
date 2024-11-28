@@ -76,6 +76,7 @@ def get_paginated_csv_dataframe(url: str, params: dict):
     # TODO add latency logging
 
     res = httpx.get(url, params=params, timeout=500).raise_for_status()
+    logging.error(f'Requesting {res.url!r}')
 
     # Process csv response
     dataframes.append(process_csv_dataframe(res.content))

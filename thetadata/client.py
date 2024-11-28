@@ -641,10 +641,12 @@ class ThetaClient:
             "exp": exp,
             "ivl": time_to_ms(ivl),
             "root": root,
-            "rth": rth
+            "rth": rth,
+            "use_csv": True
         }
 
-        return get_paginated_dataframe_request(url, params)
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     # TODO empty dataframe. Check later
     def bulk_trade_at_time(
@@ -664,13 +666,12 @@ class ThetaClient:
             "exp": exp,
             "ivl": time_to_ms(ivl),
             "root": root,
-            "rth": rth
+            "rth": rth,
+            "use_csv": True
         }
 
-        res = httpx.get(url, params=params,
-                        timeout=120).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+        return get_paginated_csv_dataframe(
+            url, {k: v for k, v in params.items() if v is not None})
 
     # endregion
 
