@@ -4,28 +4,38 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 import threading
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Thread
-from time import sleep
 from typing import Optional, get_args
 
 import httpx
 import pandas as pd
+from pydantic import ValidationError
+from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
+
+logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
 
 from . import terminal
 from .enums import *
+from .exceptions import ThetadataValidationError
 from .literals import Rate, SecurityType, Terminal
+from .models.requests import StockHistoricalEODRequest
+from .models.responses import StockHistoricalEODResponse
 from .parsing import (
     get_paginated_csv_dataframe,
     get_paginated_dataframe_request,
     parse_list,
     parse_trade
 )
-from .terminal import check_download, launch_terminal
+from .terminal import TerminalProcess, check_download, launch_terminal
 from .utils import _format_date, _format_strike, time_to_ms
 
 _NOT_CONNECTED_MSG = "You must establish a connection first."
@@ -318,6 +328,39 @@ class ThetaClient:
 
     """
 
+    def cleanup(self):
+        """Clean up all resources."""
+        try:
+            if self.terminal_process:
+                try:
+                    self.terminal_process.terminate()
+                except Exception as e:
+                    logging.warning(f"Process already terminated: {e}")
+
+            if self._stream_server:
+                try:
+                    self.close_stream()
+                except Exception as e:
+                    logging.warning(f"Error closing stream: {e}")
+
+            if self._server:
+                try:
+                    self._server.close()
+                except Exception as e:
+                    logging.warning(f"Error closing server connection: {e}")
+
+            logging.info("ThetaClient resources cleaned up")
+
+        except Exception as e:
+            logging.warning(f"Non-critical error during cleanup: {e}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+        return False  # Don't suppress exceptions from the with block
+
     def __init__(
             self,
             port: int = 25510,
@@ -326,7 +369,7 @@ class ThetaClient:
             jvm_mem: int = 0,
             username: str = "default",
             passwd: str = "default",
-            thetadata_jar = _thetadata_jar,
+            thetadata_jar=_thetadata_jar,
             auto_update: bool = True,
             use_bundle: bool = True,
             host: str = "127.0.0.1",
@@ -361,52 +404,79 @@ class ThetaClient:
             the operating system is windows.
 
         """
-        self.host: str = host
-        self.port: int = port
-        self.username = username,
+        self.host = host
+        self.port = port
+        self.username = username  # Remove comma
         self.passwd = passwd
-        self.streaming_port: int = streaming_port
+        self.streaming_port = streaming_port
         self.timeout = timeout
-        self._server: Optional[socket.socket] = None  # None while disconnected
-        self._stream_server: Optional[
-            socket.socket] = None  # None while disconnected
+        self._server = None
+        self._stream_server = None
         self.launch = launch
         self._stream_impl = None
         self._stream_responses = {}
         self._counter_lock = threading.Lock()
         self._stream_req_id = 0
         self._stream_connected = False
-        self._thetadata_jar = thetadata_jar,
-        self.jvm_mem = jvm_mem,
-        self.use_bundle = use_bundle,
-        self.move_jar = move_jar,
-        self.auto_update = auto_update,
-        self.stable = stable,
+        self._thetadata_jar = thetadata_jar  # Remove comma
+        self.jvm_mem = jvm_mem  # Remove comma
+        self.use_bundle = use_bundle  # Remove comma
+        self.move_jar = move_jar  # Remove comma
+        self.auto_update = auto_update  # Remove comma
+        self.stable = stable  # Remove comma
+        self.enum_mapper = EnumMapper()
+        self.terminal_process = TerminalProcess()
 
 
         logging.info(
             'If you require API support, feel free to join our discord server!'
             'http://discord.thetadata.us')
         if launch:
+            # Kill any existing instances
             terminal.kill_existing_terminal()
+            time.sleep(2)  # Give time for cleanup
+
+            # Handle free version warning
             if username == "default" or passwd == "default":
-                logging.warning("You are using the free version of Theta Data."
-                                " You are currently limited to 20 requests / "
-                                "minute.A data subscription can be purchased "
-                                "at https://thetadata.net. If you already have"
-                                " a ThetaData subscription, specify the "
-                                "username and passwd parameters.")
+                logging.warning(
+                    "You are using the free version of Theta Data. "
+                    "You are currently limited to 20 requests/minute. "
+                    "A data subscription can be purchased at https://thetadata.net")
 
-            if check_download(auto_update, stable):
-                Thread(target=launch_terminal,
-                       args=[username, passwd, use_bundle, jvm_mem,
-                             auto_update]).start()
-        else:
-            print(
-                "You are not launching the terminal. This means you should "
-                "have an external instance already running.")
+            # Download/update terminal if needed
+            if not terminal.check_download(auto_update, stable):
+                raise ConnectionError("Failed to download/verify terminal jar")
 
-    # region  TERMINAL  # TODO add connection manager
+            # Launch and verify terminal
+            cwd = jdk_path if use_bundle else Path.cwd()
+            if not self.terminal_process.start(cwd, username, passwd, jvm_mem):
+                raise ConnectionError(
+                    f"Failed to start terminal process: {self.terminal_process.startup_error}")
+
+            # After successful startup, verify connection
+            try:
+                max_retries = 3
+                retry_delay = 2.0
+
+                for attempt in range(max_retries):
+                    try:
+                        if self.status(service='mdds'):
+                            logging.info("Terminal ready for requests")
+                            return
+                    except Exception:
+                        if attempt < max_retries - 1:
+                            logging.warning(
+                                f"Terminal not ready, retrying in {retry_delay} seconds")
+                            time.sleep(retry_delay)
+                        else:
+                            raise ConnectionError(
+                                "Terminal failed to become ready for requests")
+            except Exception as e:
+                self.terminal_process.terminate()
+                raise ConnectionError(
+                    f"Failed to verify terminal connection: {str(e)}")
+
+    # region  TERMINAL
 
     def status(self, service: Optional[Terminal] = 'mdds'):
 
@@ -1590,18 +1660,60 @@ class ThetaClient:
             start_date: int,
             end_date: int,
             root: str) -> pd.DataFrame:
+        """Get historical end-of-day report for a stock.
+
+        :param start_date: Start date in YYYYMMDD format
+        :param end_date: End date in YYYYMMDD format
+        :param root: Stock symbol/root
+        :return: DataFrame with EOD data
+        :raises ValidationError: If input parameters are invalid
+        :raises ResponseError: If API request fails
+        :raises NoData: If no data is available
+        """
+        try:
+            # Validate request parameters
+            request = StockHistoricalEODRequest(
+                start_date=start_date,
+                end_date=end_date,
+                root=root
+            )
+        except ValidationError as e:
+            raise ThetadataValidationError(f"Invalid request parameters: {e}")
 
         url = f"http://{self.host}:{self.port}/v2/hist/stock/eod"
 
-        params = {
-            "start_date": start_date,
-            "end_date": end_date,
-            "root": root,
-        }
+        try:
+            response = httpx.get(
+                url,
+                params=request.model_dump(),
+                timeout=self.timeout
+            ).raise_for_status().json()
 
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_trade(res=res)
-        return df
+            # Validate response
+            validated_response = StockHistoricalEODResponse.model_validate(
+                response)
+
+            # Convert to DataFrame
+            df = validated_response.to_pandas()
+
+            # Map all enum columns in one go
+            df = self.enum_mapper.map_dataframe_enums(df, {
+                'bid_exchange': 'Exchange',
+                'ask_exchange': 'Exchange',
+            })
+
+            return df
+
+
+        except httpx.RequestError as exc:
+
+            print(f"An error occurred while requesting {exc.request.url!r}.")
+
+        except httpx.HTTPStatusError as exc:
+
+            print(
+                f"Error response {exc.response.status_code} while requesting "
+                f"{exc.request.url!r}.")
 
     # endregion
 

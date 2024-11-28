@@ -1,15 +1,25 @@
+import logging
 import os
 import platform
 import shutil
 import signal
 import subprocess
 import sys
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
+from threading import Event, Thread
+from typing import Optional
 
+import httpx
 import psutil
 import wget
+
+logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
 
 jdk_path = Path.home().joinpath('ThetaData').joinpath('ThetaTerminal') \
     .joinpath('jdk-19.0.1').joinpath('bin')
@@ -18,6 +28,167 @@ to_extract = Path.home().joinpath('ThetaData').joinpath('ThetaTerminal')
 
 _thetadata_jar = "ThetaTerminal.jar"
 
+
+class TerminalProcess:
+    def __init__(self):
+        self.process: Optional[subprocess.Popen] = None
+        self.ready_event = Event()
+        self.fpss_ready = Event()
+        self.mdds_ready = Event()
+        self.startup_failed = False
+        self._monitor_thread = None
+        self.startup_error = None
+
+    def _monitor_output(self):
+        """Monitor process output for startup markers."""
+        try:
+            while True:
+                if not self.process or self.process.poll() is not None:
+                    exit_code = self.process.poll() if self.process else None
+                    self.startup_failed = True
+                    self.startup_error = f"Process terminated with exit code: {exit_code}"
+                    logging.error(
+                        f"Terminal process terminated unexpectedly. Exit code: {exit_code}")
+                    # Capture and log the process output for debugging
+                    if self.process and self.process.stdout:
+                        output = self.process.stdout.read()
+                        logging.error(f"Process output: {output}")
+                    break
+
+                line = self.process.stdout.readline().strip()
+                if not line:
+                    continue
+
+                logging.debug(f"Terminal output: {line}")
+
+                if "FPSS] CONNECTED" in line:
+                    logging.info("FPSS Connected")
+                    self.fpss_ready.set()
+                elif "MDDS] CONNECTED" in line or "[MDDS] Ready" in line:
+                    logging.info("MDDS Connected")
+                    self.mdds_ready.set()
+
+                if self.fpss_ready.is_set() and self.mdds_ready.is_set():
+                    self.ready_event.set()
+
+        except Exception as e:
+            self.startup_failed = True
+            self.startup_error = str(e)
+            logging.error(f"Error in monitor thread: {e}")
+            raise
+
+    def verify_services_ready(self) -> bool:
+        """Verify both FPSS and MDDS services are actually ready to handle requests."""
+        try:
+            if not (self.fpss_ready.is_set() and self.mdds_ready.is_set()):
+                logging.info("Waiting for services to be marked as ready...")
+                return False
+
+            with httpx.Client(timeout=5.0) as client:
+                # Check basic connectivity
+                mdds_response = client.get(
+                    "http://127.0.0.1:25510/v2/system/mdds/status")
+                mdds_response.raise_for_status()
+
+                fpss_response = client.get(
+                    "http://127.0.0.1:25510/v2/system/fpss/status")
+                fpss_response.raise_for_status()
+
+                # Test actual service readiness with a simple request
+                test_response = client.get(
+                    "http://127.0.0.1:25510/v2/list/roots/stock")
+                test_response.raise_for_status()
+
+                # Add a small delay after successful verification
+                time.sleep(1.0)  # 1 second delay after verification
+
+                logging.info("Services verified and ready for requests")
+                return True
+
+        except Exception as e:
+            logging.error(f"Service verification failed: {e}")
+            return False
+
+    def terminate(self):
+        """Terminate the terminal process and all its children."""
+        if self.process:
+            try:
+                # On Windows, we need to kill child processes first
+                if platform.system() == 'Windows':
+                    process = psutil.Process(self.process.pid)
+                    for child in process.children(recursive=True):
+                        try:
+                            child.terminate()
+                            # Give it a moment to terminate gracefully
+                            child.wait(timeout=2)
+                        except psutil.TimeoutExpired:
+                            child.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+
+                # Terminate the main process
+                self.process.terminate()
+                try:
+                    # Wait for process to terminate
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if it doesn't terminate gracefully
+                    self.process.kill()
+                    self.process.wait()
+
+            except Exception as e:
+                logging.error(f"Error terminating process: {e}")
+            finally:
+                self.process = None
+
+    def start(self, cwd: Path, username: str, passwd: str,
+              jvm_mem: int = 0) -> bool:
+        """Start the terminal process and wait for successful initialization."""
+        cmd = ["java"]
+        if jvm_mem > 0:
+            cmd.extend([f"-Xmx{jvm_mem}G"])
+        cmd.extend(["-jar", "ThetaTerminal.jar", username, passwd])
+
+        logging.info(f"Starting terminal from directory: {cwd}")
+        logging.info(f"Command: {' '.join(cmd)}")
+
+        try:
+            # Start the process
+            self.process = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                universal_newlines=True,
+                text=True,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == 'Windows' else 0
+            )
+
+            # Start monitoring thread
+            self._monitor_thread = Thread(target=self._monitor_output,
+                                          daemon=True)
+            self._monitor_thread.start()
+
+            # Wait for service markers
+            if not self.ready_event.wait(timeout=60):
+                logging.error("Timeout waiting for services to start")
+                self.terminate()
+                return False
+
+            # Verify services are actually ready
+            if not self.verify_services_ready():
+                logging.error("Services failed readiness verification")
+                self.terminate()
+                return False
+
+            logging.info("Terminal startup successful")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to start terminal process: {e}")
+            self.terminate()
+            return False
 
 def bar_progress(current, total, width=80):
     progress_message = "Downloading open-jdk 19.0.1  -->  %d%% Complete" % (current / total * 100)

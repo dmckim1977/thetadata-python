@@ -4,6 +4,10 @@ from __future__ import annotations
 import enum
 from datetime import datetime, date, timedelta
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, Callable, Dict, Optional, TypedDict
+
+import pandas as pd
 
 from . import exceptions
 
@@ -313,6 +317,105 @@ class OptionReqType(enum.Enum):
     ALT_CALCS = 304
     TRADE_GREEKS_SECOND_ORDER = 305
     TRADE_GREEKS_THIRD_ORDER = 306
+
+
+EXCHANGE_MAPPING = {
+    1: {"code": "XNMS", "name": "Nasdaq Exchange"},
+    2: {"code": "XADF", "name": "Nasdaq Alternative Display Facility"},
+    3: {"code": "XNYS", "name": "New York Stock Exchange"},
+    4: {"code": "XASE", "name": "American Stock Exchange"},
+    5: {"code": "XCBO", "name": "Chicago Board Options Exchange"},
+    6: {"code": "XISX", "name": "International Securities Exchange"},
+    7: {"code": "ARCX", "name": "NYSE ARCA (Pacific)"},
+    8: {"code": "XCIS", "name": "National Stock Exchange (Cincinnati)"},
+    9: {"code": "XPHL", "name": "Philidelphia Stock Exchange"},
+    10: {"code": "OPRA", "name": "Options Pricing Reporting Authority"},
+    11: {"code": "XBOS", "name": "Boston Stock/Options Exchange"},
+    12: {"code": "XNGS", "name": "Nasdaq Global+Select Market (NMS)"},
+    13: {"code": "XNCM", "name": "Nasdaq Capital Market (SmallCap)"},
+    14: {"code": "OOTC", "name": "Nasdaq Bulletin Board"},
+    15: {"code": "OOTC", "name": "Nasdaq OTC"},
+    16: {"code": "XADF", "name": "Nasdaq Aggregate Quote"},
+    17: {"code": "CXHI", "name": "Chicago Stock Exchange"},
+    18: {"code": "XTSE", "name": "Toronto Stock Exchange"},
+    19: {"code": "XTSX", "name": "Canadian Venture Exchange"},
+    20: {"code": "XCME", "name": "Chicago Mercantile Exchange"},
+    21: {"code": "IMAG", "name": "New York Board of Trade"},
+    22: {"code": "MCRY", "name": "ISE Mercury"},
+    23: {"code": "XCEC", "name": "COMEX (division of NYMEX)"},
+    24: {"code": "GLBX", "name": "Chicago Board of Trade"},
+    25: {"code": "XNYM", "name": "New York Mercantile Exchange"},
+    26: {"code": "XKBT", "name": "Kansas City Board of Trade"},
+    27: {"code": "XMGE", "name": "Minneapolis Grain Exchange"},
+    28: {"code": "IFCA", "name": "Winnipeg Commodity Exchange"},
+    29: {"code": "XOCH", "name": "OneChicago Exchange"},
+    30: {"code": "", "name": "Dow Jones Indicies"},
+    31: {"code": "GMNI", "name": "ISE Gemini"},
+    32: {"code": "XSES", "name": "Singapore International Monetary Exchange"},
+    33: {"code": "XLON", "name": "London Stock Exchange"},
+    34: {"code": "XEUR", "name": "Eurex"},
+    35: {"code": "XAMS", "name": "EuroNext"},
+    36: {"code": "", "name": "Data Transmission Network"},
+    37: {"code": "XLME", "name": "London Metals Exchange Matched Trades"},
+    38: {"code": "XLME", "name": "London Metals Exchange"},
+    39: {"code": "IEPA", "name": "Intercontinental Exchange (IPE)"},
+    40: {"code": "XMOD", "name": "Montreal Stock Exchange"},
+    41: {"code": "XTSX", "name": "Winnipeg Stock Exchange"},
+    42: {"code": "C2OX", "name": "CBOE C2 Option Exchange"},
+    43: {"code": "XMIO", "name": "Miami Exchange"},
+    44: {"code": "XNYM", "name": "NYMEX Clearport"},
+    45: {"code": "BARX", "name": "Barclays"},
+    46: {"code": "", "name": "TenFore"},
+    47: {"code": "XBOS", "name": "NASDAQ Boston"},
+    48: {"code": "XEUR", "name": "HotSpot Eurex US"},
+    49: {"code": "XEUR", "name": "Eurex US"},
+    50: {"code": "XEUR", "name": "Eurex EU"},
+    51: {"code": "XEUC", "name": "Euronext Commodities"},
+    52: {"code": "XEUE", "name": "Euronext Index Derivatives"},
+    53: {"code": "XEUI", "name": "Euronext Interest Rates"},
+    54: {"code": "XCBF", "name": "CBOE Futures Exchange"},
+    55: {"code": "XPBT", "name": "Philadelphia Board of Trade"},
+    56: {"code": "XHAN", "name": "Hannover WTB Exchange"},
+    57: {"code": "FINN", "name": "FINRA/NASDAQ Trade Reporting Facility"},
+    58: {"code": "XADF", "name": "BSE Trade Reporting Facility"},
+    59: {"code": "FINY", "name": "NYSE Trade Reporting Facility"},
+    60: {"code": "BATS", "name": "BATS Trading"},
+    61: {"code": "XNLI", "name": "NYSE LIFFE metals contracts"},
+    62: {"code": "OTCM", "name": "Pink Sheets"},
+    63: {"code": "BATY", "name": "BATS Trading"},
+    64: {"code": "EDGA", "name": "Direct Edge"},
+    65: {"code": "EDGX", "name": "Direct Edge"},
+    66: {"code": "", "name": "Russell Indexes"},
+    67: {"code": "XIOM", "name": "CME Indexes"},
+    68: {"code": "IEXG", "name": "Investors Exchange"},
+    69: {"code": "PERL", "name": "Miami Pearl Options Exchange"},
+    70: {"code": "LSE", "name": "London Stock Exchange"},
+    71: {"code": "NYSE_GIF", "name": "NYSE Global Index Feed"},
+    72: {"code": "TSX_IDX", "name": "TSX Indexes"},
+    73: {"code": "MEMX", "name": "Members Exchange"},
+    74: {"code": "TBA_74", "name": "TBA Exchange 74"},
+    75: {"code": "Long Term Stock Exchange", "name": "Long Term Stock Exchange"},
+    76: {"code": "TBA_76", "name": "TBA Exchange 76"},
+    77: {"code": "TBA_77", "name": "TBA Exchange 77"},
+    78: {"code": "TBA_78", "name": "TBA Exchange 78"},
+    79: {"code": "TBA_79", "name": "TBA Exchange 79"}
+}
+
+# Define our mapping data
+ENUM_MAPPINGS = {
+    'Exchange': EXCHANGE_MAPPING,
+    'TradeCondition': {
+        0: {"name": "REGULAR", "description": "Regular trade"},
+        1: {"name": "FORM_T", "description": "Form T trade"},
+        # ... other mappings
+    },
+    'QuoteCondition': {
+        0: {"name": "REGULAR", "description": "Regular quote"},
+        1: {"name": "BID_ASK_AUTO_EXEC", "description": "Automatic execution"},
+        # ... other mappings
+    }
+}
+
 
 
 @enum.unique
@@ -778,4 +881,104 @@ class StreamResponseType(enum.Enum):
             if code == member.value:
                 return member
         raise exceptions._EnumParseError(code, cls)
+
+
+# Define our TypedDicts for different enum mappings
+class ExchangeInfo(TypedDict):
+    code: str
+    name: str
+
+class ConditionInfo(TypedDict):
+    name: str
+    description: str
+
+
+@dataclass(frozen=True)
+class EnumMapperConfig:
+    """Configuration for enum mapping operations"""
+    enum_type: str
+    fields: list[str]
+    default_handler: Optional[Callable[[Any], Dict[str, Any]]] = None
+
+
+class EnumMapper:
+    """Centralized enum mapping utility"""
+
+    def __init__(self):
+        self._mappers = {}
+        self._setup_default_mappers()
+
+    def _setup_default_mappers(self):
+        """Setup default mapping configurations"""
+        self.register_mapper(
+            EnumMapperConfig(
+                enum_type='Exchange',
+                fields=['code', 'name'],
+                default_handler=lambda x: {"code": f"UNKNOWN_{x}",
+                                           "name": f"Unknown Exchange ({x})"}
+            )
+        )
+        self.register_mapper(
+            EnumMapperConfig(
+                enum_type='TradeCondition',
+                fields=['name', 'description'],
+                default_handler=lambda x: {"name": f"UNKNOWN_{x}",
+                                           "description": f"Unknown Trade Condition ({x})"}
+            )
+        )
+        self.register_mapper(
+            EnumMapperConfig(
+                enum_type='QuoteCondition',
+                fields=['name', 'description'],
+                default_handler=lambda x: {"name": f"UNKNOWN_{x}",
+                                           "description": f"Unknown Quote Condition ({x})"}
+            )
+        )
+
+    def register_mapper(self, config: EnumMapperConfig):
+        """Register a new enum mapper configuration"""
+        self._mappers[config.enum_type] = config
+
+    @lru_cache(maxsize=1024)
+    def get_enum_info(self, enum_type: str, code: int) -> Dict[str, Any]:
+        """Get enum information for a given type and code"""
+        if enum_type not in self._mappers:
+            raise ValueError(f"Unknown enum type: {enum_type}")
+
+        config = self._mappers[enum_type]
+        mapping = ENUM_MAPPINGS[enum_type]
+
+        try:
+            return mapping[code]
+        except KeyError:
+            if config.default_handler:
+                return config.default_handler(code)
+            raise KeyError(f"No mapping found for {enum_type} code: {code}")
+
+    def map_dataframe_enums(self, df: pd.DataFrame,
+                            column_mappings: Dict[str, str]) -> pd.DataFrame:
+        """
+        Map enum codes in a DataFrame to their corresponding information
+
+        Args:
+            df: Input DataFrame
+            column_mappings: Dict mapping column names to enum types
+                           e.g. {'bid_exchange': 'Exchange', 'trade_condition': 'TradeCondition'}
+
+        Returns:
+            DataFrame with added enum mapping columns
+        """
+        df = df.copy()
+
+        for col, enum_type in column_mappings.items():
+            if col in df.columns:
+                config = self._mappers[enum_type]
+
+                for field in config.fields:
+                    new_col = f"{col}_{field}"
+                    df[new_col] = df[col].map(
+                        lambda x: self.get_enum_info(enum_type, x)[field]
+                    )
+
+        return df
 
