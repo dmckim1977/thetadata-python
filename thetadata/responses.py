@@ -1,4 +1,9 @@
 # Response model
+from typing import List
+
+from pydantic import BaseModel
+
+
 class OHLCV(BaseModel):
     date: str
     open: float

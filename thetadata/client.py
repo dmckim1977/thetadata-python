@@ -1,27 +1,16 @@
 """Module that contains Theta Client class."""
 import logging
-import os
-import shutil
 import socket
-import subprocess
-import time
 import threading
+import time
 import traceback
-from contextlib import contextmanager
 from pathlib import Path
 from threading import Thread
-from typing import Optional, get_args
+from typing import get_args
 
 import httpx
-import pandas as pd
-from pydantic import ValidationError
-from tenacity import retry, stop_after_attempt, wait_exponential
+from pydantic import BaseModel, ValidationError
 from tqdm import tqdm
-
-logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
 
 from . import terminal
 from .enums import *
@@ -35,7 +24,7 @@ from .parsing import (
     parse_list,
     parse_trade
 )
-from .terminal import TerminalProcess, check_download, launch_terminal
+from .terminal import TerminalProcess
 from .utils import _format_date, _format_strike, time_to_ms
 
 _NOT_CONNECTED_MSG = "You must establish a connection first."
@@ -48,7 +37,6 @@ jdk_path = Path.home().joinpath('ThetaData').joinpath('ThetaTerminal') \
 to_extract = Path.home().joinpath('ThetaData').joinpath('ThetaTerminal')
 
 _thetadata_jar = "ThetaTerminal.jar"
-
 
 _pt_to_price_mul = [
     0,
@@ -427,7 +415,6 @@ class ThetaClient:
         self.enum_mapper = EnumMapper()
         self.terminal_process = TerminalProcess()
 
-
         logging.info(
             'If you require API support, feel free to join our discord server!'
             'http://discord.thetadata.us')
@@ -504,6 +491,40 @@ class ThetaClient:
             logging.info(res.text)
         except Exception as e:
             logging.error(f'Could not close terminal. error: {e}')
+
+    # endregion
+
+    # region Boilerplate
+
+    def get(
+            self,
+            url: str,
+            request_model: Any,
+            response_model: type[BaseModel],
+    ):
+        try:
+            response = httpx.get(
+                url,
+                params=request_model.model_dump(),
+                timeout=self.timeout
+            ).raise_for_status().json()
+
+            # Validate response
+            validated_response = response_model.model_validate(
+                response)
+
+            # Convert to DataFrame
+            return validated_response.to_pandas()
+
+        except httpx.RequestError as exc:
+
+            print(f"An error occurred while requesting {exc.request.url!r}.")
+
+        except httpx.HTTPStatusError as exc:
+
+            print(
+                f"Error response {exc.response.status_code} while requesting "
+                f"{exc.request.url!r}.")
 
     # endregion
 
@@ -1682,38 +1703,20 @@ class ThetaClient:
 
         url = f"http://{self.host}:{self.port}/v2/hist/stock/eod"
 
-        try:
-            response = httpx.get(
-                url,
-                params=request.model_dump(),
-                timeout=self.timeout
-            ).raise_for_status().json()
+        df = self.get(
+            url=url,
+            request_model=request,
+            response_model=StockHistoricalEODResponse
+        )
 
-            # Validate response
-            validated_response = StockHistoricalEODResponse.model_validate(
-                response)
+        # Map all enum columns in one go
+        df = self.enum_mapper.map_dataframe_enums(df, {
+            'bid_exchange': 'Exchange',
+            'ask_exchange': 'Exchange',
+        })
 
-            # Convert to DataFrame
-            df = validated_response.to_pandas()
+        return df
 
-            # Map all enum columns in one go
-            df = self.enum_mapper.map_dataframe_enums(df, {
-                'bid_exchange': 'Exchange',
-                'ask_exchange': 'Exchange',
-            })
-
-            return df
-
-
-        except httpx.RequestError as exc:
-
-            print(f"An error occurred while requesting {exc.request.url!r}.")
-
-        except httpx.HTTPStatusError as exc:
-
-            print(
-                f"Error response {exc.response.status_code} while requesting "
-                f"{exc.request.url!r}.")
 
     # endregion
 

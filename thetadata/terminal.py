@@ -16,11 +16,6 @@ import httpx
 import psutil
 import wget
 
-logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
 jdk_path = Path.home().joinpath('ThetaData').joinpath('ThetaTerminal') \
     .joinpath('jdk-19.0.1').joinpath('bin')
 
