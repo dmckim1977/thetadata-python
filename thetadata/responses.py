@@ -13,6 +13,6 @@ class OHLCV(BaseModel):
     volume: int
 
 class StockHistoricalEODReport(BaseModel):
-    trades: List[TradeData]
+    trades: List[OHLCV]
     symbol: str
     market: str
