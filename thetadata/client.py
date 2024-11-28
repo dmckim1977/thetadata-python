@@ -10,7 +10,6 @@ from typing import get_args
 
 import httpx
 from pydantic import BaseModel, ValidationError
-from tqdm import tqdm
 
 from . import terminal
 from .enums import *

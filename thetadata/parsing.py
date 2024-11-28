@@ -10,7 +10,7 @@ from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
 import httpx
-import ijson
+# import ijson
 import numpy as np
 import pandas as pd
 import requests
@@ -466,45 +466,45 @@ def parse_hist_REST(response: requests.Response) -> pd.DataFrame:
         ) from e
 
 
-def parse_hist_REST_stream_ijson(url, params) -> pd.DataFrame:
-    url = url + '?' + urlencode(params)
-    f = urlopen(url)
-    header = {}
-    row = []
-    header_format = []
-    loc = 0
-    for prefix, event, value in ijson.parse(f, use_float=True):
-        if prefix == "response.item.item":
-            row.append(value)
-
-        elif prefix == "response.item" and event == "end_array":
-            df.loc[loc] = row
-            loc += 1
-            row = []
-
-        elif prefix == "header.format.item":
-            header_format.append(value)
-
-        elif prefix[:6] == "header" and len(prefix) > 6:
-            header[prefix[7:]] = value
-
-        elif event == "map_key" and value == "response":
-            header["format"] = header_format
-            _check_header_errors_REST(header)
-            cols = [DataType.from_string(name=col) for col in header['format']]
-            df = pd.DataFrame(columns=cols)
-
-    if DataType.DATE in df.columns:
-        df[DataType.DATE] = pd.to_datetime(
-            df[DataType.DATE], format="%Y%m%d"
-        )
-    try:
-        return df
-    except Exception as e:
-        raise ResponseParseError(
-            f"Failed to parse header for request: {url}. "
-            f"Please send this error to support."
-        ) from e
+# def parse_hist_REST_stream_ijson(url, params) -> pd.DataFrame:
+#     url = url + '?' + urlencode(params)
+#     f = urlopen(url)
+#     header = {}
+#     row = []
+#     header_format = []
+#     loc = 0
+#     for prefix, event, value in ijson.parse(f, use_float=True):
+#         if prefix == "response.item.item":
+#             row.append(value)
+#
+#         elif prefix == "response.item" and event == "end_array":
+#             df.loc[loc] = row
+#             loc += 1
+#             row = []
+#
+#         elif prefix == "header.format.item":
+#             header_format.append(value)
+#
+#         elif prefix[:6] == "header" and len(prefix) > 6:
+#             header[prefix[7:]] = value
+#
+#         elif event == "map_key" and value == "response":
+#             header["format"] = header_format
+#             _check_header_errors_REST(header)
+#             cols = [DataType.from_string(name=col) for col in header['format']]
+#             df = pd.DataFrame(columns=cols)
+#
+#     if DataType.DATE in df.columns:
+#         df[DataType.DATE] = pd.to_datetime(
+#             df[DataType.DATE], format="%Y%m%d"
+#         )
+#     try:
+#         return df
+#     except Exception as e:
+#         raise ResponseParseError(
+#             f"Failed to parse header for request: {url}. "
+#             f"Please send this error to support."
+#         ) from e
 
 # def parse_hist_REST_stream(url, params) -> pd.DataFrame:
 #     header = {}
