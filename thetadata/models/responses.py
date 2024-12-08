@@ -1,10 +1,11 @@
-from datetime import date, datetime, time
-from typing import List, Optional, Union, Any
-from pydantic import BaseModel, Field, field_validator, ValidationInfo
+from datetime import date, datetime
+from io import StringIO
+from typing import Any, List, Optional, Union
 from zoneinfo import ZoneInfo
-import pandas as pd
 
-from ..enums import Exchange, QuoteCondition
+import pandas as pd
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
+
 from ..utils import ms_to_time
 
 
@@ -141,3 +142,178 @@ class ExpirationsResponse(BaseModel):
     def __repr__(self):
         """Show as a list of dates."""
         return repr(self.response)
+
+
+class IndicesHistoricalEODRow(BaseModel):
+    """Single row of indices historical EOD data."""
+    ms_of_day: int = Field(...,
+                           description="Milliseconds since midnight Eastern")
+    ms_of_day2: int = Field(...,
+                            description="Milliseconds since midnight Eastern")
+    open: float = Field(..., description="Opening price")
+    high: float = Field(..., description="High price")
+    low: float = Field(..., description="Low price")
+    close: float = Field(..., description="Closing price")
+    date: int = Field(..., description="Date in YYYY-MM-DD format")
+
+
+class IndicesHistoricalEODResponse(BaseModel):
+    """Response model for indices historical EOD data."""
+    data: List[IndicesHistoricalEODRow]
+
+    @classmethod
+    def from_csv(cls, csv_content: str) -> 'IndicesHistoricalEODResponse':
+        """Create response model from CSV content."""
+        df = pd.read_csv(StringIO(csv_content))
+        rows = [IndicesHistoricalEODRow(**row) for row in
+                df.to_dict('records')]
+        return cls(data=rows)
+
+    def to_pandas(self) -> pd.DataFrame:
+        """Convert response to pandas DataFrame with proper formatting."""
+        # Create DataFrame from response data
+        df = pd.DataFrame([row.model_dump() for row in self.data])
+
+        # Convert date format
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], format='%Y%m%d').dt.date
+
+        # Handle ms_of_day conversions
+        if 'ms_of_day' in df.columns:
+            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
+
+        if 'ms_of_day2' in df.columns:
+            df['ms_of_day2'] = df['ms_of_day2'].apply(ms_to_time)
+
+        # Create datetime columns if we have both date and time
+        if {'date', 'ms_of_day'}.issubset(df.columns):
+            df['eod_datetime'] = df.apply(
+                lambda row: datetime.combine(row['date'],
+                                             row['ms_of_day']).replace(
+                    tzinfo=ZoneInfo("US/Eastern")
+                ),
+                axis=1
+            )
+            df.set_index('eod_datetime', inplace=True)
+        # If we only have date, set it as index
+        elif 'date' in df.columns:
+            df.set_index('date', inplace=True)
+
+        return df
+
+
+class IndicesHistoricalPriceRow(BaseModel):
+    """Single row of indices historical price data."""
+    ms_of_day: int = Field(
+        ...,
+        description="Milliseconds since midnight Eastern"
+    )
+    price: float = Field(
+        ...,
+        description="The reported price of the index"
+    )
+    date: int = Field(
+        ...,
+        description="Date in YYYYMMDD format"
+    )
+
+
+class IndicesHistoricalPriceResponse(BaseModel):
+    """Response model for indices historical price data."""
+    data: List[IndicesHistoricalPriceRow]
+
+    @classmethod
+    def from_csv(cls, csv_content: str) -> 'IndicesHistoricalPriceResponse':
+        """Create response model from CSV content."""
+        df = pd.read_csv(StringIO(csv_content))
+        rows = [IndicesHistoricalPriceRow(**row) for row in
+                df.to_dict('records')]
+        return cls(data=rows)
+
+    def to_pandas(self) -> pd.DataFrame:
+        """Convert response to pandas DataFrame with proper formatting.
+
+        Returns:
+            DataFrame with properly formatted columns:
+            - date converted to datetime.date
+            - ms_of_day converted to time object
+            - Creates a datetime index in ET timezone if both date and ms_of_day present
+        """
+        # Create DataFrame from response data
+        df = pd.DataFrame([row.model_dump() for row in self.data])
+
+        # Convert date format
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], format='%Y%m%d').dt.date
+
+        # Handle ms_of_day conversion
+        if 'ms_of_day' in df.columns:
+            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
+
+        # Create datetime index if we have both date and time
+        if {'date', 'ms_of_day'}.issubset(df.columns):
+            df['price_datetime'] = df.apply(
+                lambda row: datetime.combine(row['date'],
+                                             row['ms_of_day']).replace(
+                    tzinfo=ZoneInfo("US/Eastern")
+                ),
+                axis=1
+            )
+            df.set_index('price_datetime', inplace=True)
+        # If we only have date, set it as index
+        elif 'date' in df.columns:
+            df.set_index('date', inplace=True)
+
+        return df
+
+
+class IndicesSnapshotsPriceResponse(BaseModel):
+    """Response model for index price snapshot data.
+
+    Represents current price information for an index.
+
+    :param ms_of_day: Milliseconds since midnight Eastern
+    :param price: The reported price of the index
+    :param date: Date in YYYYMMDD format
+    """
+    ms_of_day: int = Field(
+        ...,
+        description="Milliseconds since midnight Eastern"
+    )
+    price: float = Field(
+        ...,
+        description="The reported price of the index"
+    )
+    date: int = Field(
+        ...,
+        description="Date in YYYYMMDD format"
+    )
+
+    def to_pandas(self) -> pd.DataFrame:
+        """Convert response to pandas DataFrame with proper formatting."""
+        # Create single row DataFrame
+        df = pd.DataFrame([self.model_dump()])
+
+        # Convert date format
+        if 'date' in df.columns:
+            df['date'] = pd.to_datetime(df['date'], format='%Y%m%d').dt.date
+
+        # Handle ms_of_day conversion
+        if 'ms_of_day' in df.columns:
+            df['ms_of_day'] = df['ms_of_day'].apply(ms_to_time)
+
+        # Create datetime index
+        if {'date', 'ms_of_day'}.issubset(df.columns):
+            df['snapshot_datetime'] = df.apply(
+                lambda row: datetime.combine(row['date'],
+                                             row['ms_of_day']).replace(
+                    tzinfo=ZoneInfo("US/Eastern")
+                ),
+                axis=1
+            )
+            df.set_index('snapshot_datetime', inplace=True)
+        # If we only have date, set it as index
+        elif 'date' in df.columns:
+            df.set_index('date', inplace=True)
+
+        return df

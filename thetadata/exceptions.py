@@ -1,105 +1,173 @@
-"""Module that contains custom exceptions."""
-import enum
-from typing import Any, Optional
-
+"""Module containing custom exceptions for Thetadata API."""
+from typing import Any, Optional, Dict
 
 class ThetadataError(Exception):
-    """Base exception class for all Thetadata exceptions."""
-    def __init__(self, message: str, details: Optional[dict] = None):
+    """Base exception class for all Thetadata exceptions.
+
+    :param message: Human readable error message
+    :param details: Optional dictionary containing additional error details
+    :param error_code: Optional error code from Thetadata API
+    """
+    def __init__(
+        self,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+        error_code: Optional[int] = None
+    ):
         self.message = message
         self.details = details or {}
+        self.error_code = error_code
         super().__init__(self.message)
 
     def __str__(self) -> str:
+        base_message = self.message
+        if self.error_code:
+            base_message = f"[Error {self.error_code}] {base_message}"
         if self.details:
-            return f"{self.message}\nDetails: {self.details}"
-        return self.message
+            return f"{base_message}\nDetails: {self.details}"
+        return base_message
 
 
-class ResponseParseError(ThetadataError):
-    """Raised if the API failed to parse a Terminal response."""
+class NoImplementationError(ThetadataError):
+    """Raised when there is no implementation for the requested endpoint (404).
+
+    This error occurs when either:
+    - The request being made is invalid
+    - Using an outdated Theta Terminal version
+    """
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "No implementation found for this request. Check if the request is valid or update Theta Terminal."
+        super().__init__(message=message, details=details, error_code=404)
 
 
-class EnumParseError(ThetadataError):
-    """Raised when a value cannot be parsed into an associated enum member."""
-    def __init__(self, value: Any, enm: Any):
-        """Create a new EnumParseError
+class OSLimitError(ThetadataError):
+    """Raised when the operating system is throttling requests (429).
 
-        :param value: The value that cannot be parsed.
-        :param enm: The enum.
-        """
-        assert issubclass(enm, enum.Enum), "Cannot create an EnumParseError with a non-enum."
-        details = {
-            "value": value,
-            "enum_name": enm.__name__
-        }
-        super().__init__(f"Value {value} cannot be parsed into a {enm.__name__}!", details)
+    This occurs when making a large amount of small low latency requests.
+    The request should be retried until this error no longer occurs.
+    """
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Operating system is throttling requests. Retry the request."
+        super().__init__(message=message, details=details, error_code=429)
 
 
-class ResponseError(ThetadataError):
-    """Raised if there is an error in the body of a response."""
-
-
-class NoDataError(ThetadataError):
-    """Raised if no data is available for this request."""
-
-
-class ConnectionError(ThetadataError):
-    """Raised if connection to the server fails."""
-    def __init__(self, message: str, host: Optional[str] = None, port: Optional[int] = None):
-        details = {"host": host, "port": port} if host and port else {}
-        super().__init__(f"Connection error: {message}", details)
-
-
-class ThetadataValidationError(ThetadataError):
-    """Exception raised when request parameters fail validation."""
-    @classmethod
-    def from_pydantic(cls, pydantic_error) -> 'ThetadataValidationError':
-        """Convert a Pydantic ValidationError to our custom ValidationError."""
-        details = {}
-        for error in pydantic_error.errors():
-            field = " -> ".join(str(loc) for loc in error["loc"])
-            details[field] = error["msg"]
-        return cls("Validation failed", details)
-
-
-class AuthenticationError(ThetadataError):
-    """Raised when authentication fails (401 errors)."""
-    def __init__(self, message: str, response: Optional[Any] = None):
-        details = {"response": str(response)} if response else {}
-        super().__init__(f"Authentication error: {message}", details)
+class GeneralError(ThetadataError):
+    """Raised for general/unspecified errors from the API (470)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "A general error occurred"
+        super().__init__(message=message, details=details, error_code=470)
 
 
 class PermissionError(ThetadataError):
-    """Raised when user lacks required permissions (403 errors)."""
-    def __init__(self, message: str, response: Optional[Any] = None):
-        details = {"response": str(response)} if response else {}
-        super().__init__(f"Permission error: {message}", details)
+    """Raised when account lacks required permissions (471)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Your account does not have the required permissions"
+        super().__init__(message=message, details=details, error_code=471)
 
 
-class RateLimitError(ThetadataError):
-    """Raised when API rate limit is exceeded (429 errors)."""
-    def __init__(self, message: str, response: Optional[Any] = None):
-        details = {"response": str(response)} if response else {}
-        super().__init__(f"Rate limit error: {message}", details)
+class NoDataError(ThetadataError):
+    """Raised when no data is found for the specified request (472)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "No data found for the specified request"
+        super().__init__(message=message, details=details, error_code=472)
+
+
+class InvalidParamsError(ThetadataError):
+    """Raised when request parameters/syntax are invalid (473).
+
+    This may be resolved by updating to the latest version of Theta Terminal.
+    """
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Invalid parameters or syntax in request"
+        super().__init__(message=message, details=details, error_code=473)
+
+
+class DisconnectedError(ThetadataError):
+    """Raised when connection to Theta Data MDDS is lost (474)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Connection lost to Theta Data MDDS"
+        super().__init__(message=message, details=details, error_code=474)
+
+
+class TerminalParseError(ThetadataError):
+    """Raised when there's an issue parsing the request after receipt (475)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Terminal failed to parse the received request"
+        super().__init__(message=message, details=details, error_code=475)
+
+
+class WrongIPError(ThetadataError):
+    """Raised when IP address doesn't match initial request IP (476).
+
+    Requests must use the same IP (cannot switch between 127.0.0.1 and localhost).
+    """
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "IP address mismatch. Use consistent IP for requests"
+        super().__init__(message=message, details=details, error_code=476)
+
+
+class NoPageError(ThetadataError):
+    """Raised when requested page doesn't exist or has expired (477)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Page does not exist or has expired"
+        super().__init__(message=message, details=details, error_code=477)
+
+
+class LargeRequestError(ThetadataError):
+    """Raised when request asks for too much data (570)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Request exceeds maximum allowed data size"
+        super().__init__(message=message, details=details, error_code=570)
+
+
+class ServerStartingError(ThetadataError):
+    """Raised when server is intentionally restarting (571)."""
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Server is currently restarting"
+        super().__init__(message=message, details=details, error_code=571)
+
+
+class UncaughtError(ThetadataError):
+    """Raised for uncaught server errors (572).
+
+    When encountering this error, contact support with the exact request details.
+    """
+    def __init__(self, message: Optional[str] = None, details: Optional[Dict[str, Any]] = None):
+        message = message or "Uncaught server error occurred. Contact support with request details"
+        super().__init__(message=message, details=details, error_code=572)
 
 
 class ServiceError(ThetadataError):
-    """Raised when API service encounters an error (5xx errors)."""
-    def __init__(self, message: str, response: Optional[Any] = None, status_code: Optional[int] = None):
-        details = {
-            "response": str(response) if response else None,
-            "status_code": status_code
-        }
-        super().__init__(f"Service error: {message}", details)
+    """Raised when the API service encounters an error (5xx errors).
+
+    This is a general server-side error for HTTP 5xx status codes that don't
+    map to specific Thetadata error codes.
+    """
+    def __init__(
+        self,
+        message: str = "Service error occurred",
+        details: Optional[Dict[str, Any]] = None,
+        status_code: Optional[int] = None
+    ):
+        if status_code:
+            details = details or {}
+            details["status_code"] = status_code
+        super().__init__(message=message, details=details)
 
 
-class ThetadataConnectionError(ThetadataError):
-    """Raised if connection to the server fails."""
-    def __init__(self, message: str, host: Optional[str] = None, port: Optional[int] = None):
-        details = {"host": host, "port": port} if host and port else {}
-        super().__init__(f"Connection error: {message}", details)
-
-
-class ReconnectingError(ThetadataConnectionError):
-    """Raised if the connection has been lost and a reconnection attempt is being made."""
+# HTTP Status Code to Exception mapping
+ERROR_CODE_MAP = {
+    404: NoImplementationError,
+    429: OSLimitError,
+    470: GeneralError,
+    471: PermissionError,
+    472: NoDataError,
+    473: InvalidParamsError,
+    474: DisconnectedError,
+    475: TerminalParseError,
+    476: WrongIPError,
+    477: NoPageError,
+    570: LargeRequestError,
+    571: ServerStartingError,
+    572: UncaughtError
+}

@@ -1,4 +1,5 @@
 """Module that contains Theta Client class."""
+import io
 import json
 import logging
 import socket
@@ -7,7 +8,7 @@ import time
 import traceback
 from pathlib import Path
 from threading import Thread
-from typing import List, NoReturn, Type, Union, get_args, io
+from typing import List, NoReturn, Type, Union, get_args
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -15,19 +16,19 @@ from pydantic import BaseModel, ValidationError
 from . import terminal
 from .enums import *
 from .exceptions import (
-    ThetadataError,
-    ThetadataValidationError,
-    NoDataError,
-    ThetadataConnectionError,  # Changed from ConnectionError
-    AuthenticationError,
-    PermissionError,
-    RateLimitError,
+    DisconnectedError, ERROR_CODE_MAP, InvalidParamsError, OSLimitError,
     ServiceError,
-    ResponseParseError
+    TerminalParseError, ThetadataError,
+    NoDataError,
+    PermissionError,
 )
 from .literals import Rate, SecurityType, Terminal
-from .models.requests import ExpirationsRequest, StockHistoricalEODRequest
-from .models.responses import ExpirationsResponse, StockHistoricalEODResponse
+from .models.requests import ExpirationsRequest, IndicesHistoricalEODRequest, \
+    IndicesHistoricalPriceRequest, IndicesSnapshotsPriceRequest, \
+    StockHistoricalEODRequest
+from .models.responses import ExpirationsResponse, \
+    IndicesHistoricalEODResponse, IndicesHistoricalPriceResponse, \
+    IndicesSnapshotsPriceResponse, StockHistoricalEODResponse
 from .parsing import (
     get_paginated_csv_dataframe,
     get_paginated_dataframe_request,
@@ -542,7 +543,7 @@ class ThetaClient:
 
         :param error: The HTTP error from httpx
         :param params: Optional request parameters for context
-        :raises: Appropriate ThetadataError subclass
+        :raises: Appropriate ThetadataError subclass based on error code
         """
         status_code = error.response.status_code
         response_body = None
@@ -556,52 +557,31 @@ class ThetaClient:
             except Exception:
                 response_body = str(error)
 
-        # Map status codes to exceptions
-        if status_code == 400:
-            raise ThetadataValidationError(
-                "Invalid request parameters",
-                {"params": params, "response": response_body}
-            )
-        elif status_code == 401:
-            raise AuthenticationError(
-                "Invalid credentials or unauthorized access",
-                {"response": response_body}
-            )
-        elif status_code == 403:
-            raise PermissionError(
-                "Insufficient permissions to access this resource",
-                {"response": response_body}
-            )
-        elif status_code == 404:
-            raise NoDataError(
-                "No data found for the requested parameters",
-                {"params": params}
-            )
-        elif status_code == 429:
-            raise RateLimitError(
-                "Rate limit exceeded",
-                {"response": response_body}
-            )
-        elif status_code == 472:  # ThetaData specific error code
-            raise ThetadataValidationError(
-                "Invalid request parameters or symbol",
-                {"params": params, "response": response_body}
-            )
-        elif status_code >= 500:
+        # Extract error details
+        details = {
+            "status_code": status_code,
+            "params": params,
+            "response": response_body
+        }
+
+        # Handle Thetadata specific error codes
+        if status_code in ERROR_CODE_MAP:
+            exception_class = ERROR_CODE_MAP[status_code]
+            raise exception_class(details=details)
+
+        # Handle generic 5xx errors
+        if status_code >= 500:
             raise ServiceError(
-                "Service error occurred",
-                response=response_body,
+                message=f"Service error occurred: {response_body}",
+                details=details,
                 status_code=status_code
             )
-        else:
-            raise ThetadataError(
-                f"Unexpected HTTP status code: {status_code}",
-                {
-                    "status_code": status_code,
-                    "response": response_body,
-                    "params": params
-                }
-            )
+
+        # Handle any other unknown errors
+        raise ThetadataError(
+            message=f"Unexpected HTTP status code: {status_code}",
+            details=details
+        )
 
     def _make_request(
             self,
@@ -640,16 +620,23 @@ class ThetaClient:
 
                 # Handle CSV response
                 if 'text/csv' in content_type:
-                    content = io.StringIO()
-                    for line in response.iter_lines():
-                        content.write(line.decode('utf-8') + '\n')
-                    content.seek(0)
-                    df = pd.read_csv(content)
-                    combined_data.extend(df.to_dict('records'))
+                    try:
+                        # Read the content
+                        content = response.read()
+                        df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+
+                        # Convert to list of dicts for model validation
+                        rows = df.to_dict('records')
+                        if not combined_data:
+                            combined_data = rows
+                        else:
+                            combined_data.extend(rows)
+                    except Exception as e:
+                        raise TerminalParseError(
+                            f"Failed to parse CSV response: {str(e)}")
 
                 # Handle JSON response
                 elif 'application/json' in content_type:
-                    # Read the entire response before parsing JSON
                     content = response.read()
                     data = json.loads(content.decode('utf-8'))
                     if not combined_data:
@@ -658,37 +645,34 @@ class ThetaClient:
                         combined_data['response'].extend(data['response'])
                         combined_data['header'] = data['header']
                 else:
-                    raise ResponseParseError(
+                    raise TerminalParseError(
                         f"Unexpected content type: {content_type}"
                     )
 
-            # Check for next page
-            next_page = response.headers.get('next-page')
-            if next_page and next_page.lower() != "null":
-                current_url = next_page
-                params = None  # Don't send params again for subsequent requests
-                logging.info(f"Fetching next page: {current_url}")
-            else:
-                current_url = None
+                # Check for next page
+                next_page = response.headers.get('next-page')
+                if next_page and next_page.lower() != "null":
+                    current_url = next_page
+                    params = None  # Don't send params again for subsequent requests
+                    logging.info(f"Fetching next page: {current_url}")
+                else:
+                    current_url = None
 
-        # For CSV responses, format data to match JSON structure
+        # For CSV responses, create model instance from rows
         if 'text/csv' in first_response_headers.get('content-type', ''):
-            formatted_response = {
-                'header': {
-                    'format': list(pd.DataFrame(combined_data).columns),
-                    'latency_ms': int(
-                        first_response_headers.get('latency', 0)),
-                    'next_page': None
-                },
-                'response': combined_data
-            }
-            combined_data = formatted_response
+            try:
+                return model_response(data=combined_data)
+            except ValidationError as e:
+                raise TerminalParseError(
+                    "Failed to parse CSV data",
+                    {"validation_errors": e.errors()}
+                )
 
-        # Validate the combined data
+        # For JSON responses, validate as before
         try:
             return model_response.model_validate(combined_data)
         except ValidationError as e:
-            raise ResponseParseError(
+            raise TerminalParseError(
                 "Failed to parse response data",
                 {"validation_errors": e.errors()}
             )
@@ -1868,7 +1852,7 @@ class ThetaClient:
                 root=root
             )
         except ValidationError as e:
-            raise ThetadataValidationError(f"Invalid request parameters: {e}")
+            raise InvalidParamsError(f"Invalid request parameters: {e}")
 
         url = f"http://{self.host}:{self.port}/v2/hist/stock/eod"
 
@@ -1912,6 +1896,120 @@ class ThetaClient:
         return df
 
     # endregion
+
+    def indices_historical_eod_report(
+            self,
+            root: str,
+            start_date: int,
+            end_date: int,
+    ) -> pd.DataFrame:
+        """Get historical end-of-day report for an index.
+
+        :param root: The index symbol/root (e.g., 'SPX')
+        :param start_date: Start date in YYYYMMDD format
+        :param end_date: End date in YYYYMMDD format
+        :return: DataFrame with EOD data including open, high, low, close prices
+        :raises InvalidParamsError: If the request parameters are invalid
+        :raises NoDataError: If no data exists for the given parameters
+        :raises ServiceError: If the API service encounters an error
+        """
+        try:
+            # Validate request parameters
+            request = IndicesHistoricalEODRequest(
+                root=root,
+                start_date=start_date,
+                end_date=end_date
+            )
+        except ValidationError as e:
+            raise InvalidParamsError(f"Invalid request parameters: {e}")
+
+        # Make request and get validated response
+        validated_response = self._make_request(
+            url=f"http://{self.host}:{self.port}/v2/hist/index/eod",
+            params={'use_csv': True, **request.model_dump()},
+            model_response=IndicesHistoricalEODResponse
+        )
+
+        # Convert to DataFrame with proper formatting
+        return validated_response.to_pandas()
+
+    def indices_historical_price(
+            self,
+            root: str,
+            start_date: int,
+            end_date: int,
+            ivl: int = 0,
+            rth: bool = True,
+    ) -> pd.DataFrame:
+        """Get historical price data for an index.
+
+        :param root: The index symbol/root (e.g., 'SPX')
+        :param start_date: Start date in YYYYMMDD format
+        :param end_date: End date in YYYYMMDD format
+        :param ivl: Interval size in milliseconds (e.g., 60000 for 1 minute).
+                   If 0, returns tick-level data.
+        :param rth: If True, only return data during regular trading hours (09:30-16:00 ET).
+                   For tick-level data (ivl=0), rth is forced to False.
+        :return: DataFrame with price data, including:
+                - price: float
+                - date: datetime.date
+                - ms_of_day: datetime.time
+        :raises InvalidParamsError: If the request parameters are invalid
+        :raises NoDataError: If no data exists for the given parameters
+        :raises ServiceError: If the API service encounters an error
+        """
+        try:
+            # Validate request parameters
+            request = IndicesHistoricalPriceRequest(
+                root=root,
+                start_date=start_date,
+                end_date=end_date,
+                ivl=ivl,
+                rth=rth
+            )
+        except ValidationError as e:
+            raise InvalidParamsError(f"Invalid request parameters: {e}")
+
+        # Make request and get validated response
+        validated_response = self._make_request(
+            url=f"http://{self.host}:{self.port}/v2/hist/index/price",
+            params={'use_csv': True, **request.model_dump()},
+            model_response=IndicesHistoricalPriceResponse
+        )
+
+        # Convert to DataFrame with proper formatting
+        return validated_response.to_pandas()
+
+    def indices_snapshots_price_snapshot(
+            self,
+            root: str,
+    ) -> IndicesSnapshotsPriceResponse:
+        """Get real-time price snapshot for an index.
+
+        :param root: The index symbol/root (e.g., 'SPX', 'NDX')
+        :return: Price snapshot data including:
+                - price: float
+                - date: datetime.date
+                - ms_of_day: datetime.time
+        :raises InvalidParamsError: If the request parameters are invalid
+        :raises NoDataError: If no data exists for the given parameters
+        :raises ServiceError: If the API service encounters an error
+        """
+        try:
+            # Validate request parameters
+            request = IndicesSnapshotsPriceRequest(root=root)
+        except ValidationError as e:
+            raise InvalidParamsError(f"Invalid request parameters: {e}")
+
+        # Make request and get validated response
+        validated_response = self._make_request(
+            url=f"http://{self.host}:{self.port}/v2/snapshot/index/price",
+            params=request.model_dump(),
+            model_response=IndicesSnapshotsPriceResponse
+        )
+
+        return validated_response
+
 
     # region ################# STREAMING ########################## # TODO Have not touched yet
     def connect_stream(self, callback) -> Thread:

@@ -4,7 +4,7 @@ from thetadata import ThetaClient
 
 
 @pytest.fixture
-def tc():
+def theta_client():
     """Generate a ThetaClient connected to the Terminal."""
     client = ThetaClient(timeout=15, launch=False)
     with client.connect():

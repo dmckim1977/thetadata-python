@@ -16,8 +16,6 @@ import pandas as pd
 import requests
 
 from .enums import DataType
-from .exceptions import NoDataError, ReconnectingError, ResponseError, \
-    ResponseParseError
 from .utils import ms_to_time
 
 HEADER_MAX_LENGTH = 300  # max length of header in characters
@@ -64,7 +62,7 @@ def process_csv_dataframe(content: bytes) -> pd.DataFrame:
         return df
 
     except Exception as e:
-        raise ResponseParseError(
+        raise Exception(
             f'Failed to parse list for request. '
             f'Please send this error to support. {e}')
 
@@ -163,7 +161,7 @@ def parse_list(res: json, name: str, dates: bool = False) -> pd.Series:
         else:
             return lst.sort_values()
     except Exception as e:
-        raise ResponseParseError(
+        raise Exception(
             f'Failed to parse list for request: {name}. '
             f'Please send this error to support. {e}')
 
@@ -212,7 +210,7 @@ def parse_trade(res: json) -> pd.DataFrame:
         return df
 
     except Exception as e:
-        raise ResponseParseError(
+        raise Exception(
             f'Failed to parse list for request. '
             f'Please send this error to support. {e}')
 
@@ -231,7 +229,7 @@ def parse_header_REST(response: requests.Response, header_string: str) -> dict:
     try:
         return json.loads(header_string)
     except Exception as e:
-        raise ResponseParseError(
+        raise Exception(
             f"Failed to parse header for request: {url}. "
             f"Please send this error to support."
         ) from e
@@ -271,12 +269,7 @@ def _check_header_errors_REST(header: dict):
     if error is not None:
         if header.get("error_type").lower() != "null":
             msg = header["error_msg"]
-            if "no data" in msg.lower():
-                raise NoData(msg)
-            elif "disconnected" in msg.lower():
-                raise ReconnectingToServer(msg)
-            else:
-                raise ResponseError(msg)
+            pass
 
 
 # map price types to price multipliers
@@ -436,7 +429,7 @@ def parse_flexible_REST(response: requests.Response) -> pd.DataFrame:
     try:
         return df
     except Exception as e:
-        raise ResponseParseError(
+        raise Exception(
             f"Failed to parse header for request: {response.url}. "
             f"Please send this error to support."
         ) from e
@@ -460,7 +453,7 @@ def parse_hist_REST(response: requests.Response) -> pd.DataFrame:
     try:
         return df
     except Exception as e:
-        raise ResponseParseError(
+        raise Exception(
             f"Failed to parse header for request: {url}. "
             f"Please send this error to support."
         ) from e
