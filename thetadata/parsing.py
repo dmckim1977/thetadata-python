@@ -16,7 +16,7 @@ import pandas as pd
 import requests
 
 from .enums import DataType
-from .exceptions import NoData, ReconnectingToServer, ResponseError, \
+from .exceptions import NoDataError, ReconnectingError, ResponseError, \
     ResponseParseError
 from .utils import ms_to_time
 

@@ -1,4 +1,4 @@
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import List, Optional, Union, Any
 from pydantic import BaseModel, Field, field_validator, ValidationInfo
 from zoneinfo import ZoneInfo
@@ -78,3 +78,66 @@ class StockHistoricalEODResponse(BaseModel):
                 )
 
         return v
+
+
+class ExpirationsResponse(BaseModel):
+    """Response model for option expirations data.
+
+    Acts like a list of expiration dates while providing helper methods
+    for different formats.
+    """
+    header: ResponseHeader
+    response: List[int] = Field(...,
+                                description="List of expiration dates in YYYYMMDD format")
+
+    @field_validator('response')
+    @classmethod
+    def validate_expirations(cls, v: List[int]) -> List[int]:
+        """Validate each expiration date."""
+        for exp in v:
+            str_date = str(exp)
+            if len(str_date) != 8:
+                raise ValueError(f"Expiration {exp} not in YYYYMMDD format")
+            try:
+                year = int(str_date[:4])
+                month = int(str_date[4:6])
+                day = int(str_date[6:8])
+                date(year, month, day)
+            except ValueError:
+                raise ValueError(f"Invalid expiration date: {exp}")
+        return sorted(v)  # Return sorted list for consistency
+
+    def as_pandas(self) -> pd.Series:
+        """Convert expirations to pandas Series with datetime index."""
+        return pd.Series(
+            index=pd.to_datetime(self.response, format='%Y%m%d'),
+            data=self.response,
+            name="expirations"
+        )
+
+    def as_dates(self) -> List[datetime.date]:
+        """Convert expirations to list of datetime.date objects."""
+        return [
+            datetime.strptime(str(exp), '%Y%m%d').date()
+            for exp in self.response
+        ]
+
+    def __iter__(self):
+        """Allow direct iteration over expiration dates."""
+        return iter(self.response)
+
+    def __len__(self):
+        """Return number of expirations."""
+        return len(self.response)
+
+    def __getitem__(self, idx):
+        """Allow indexing like a list."""
+        return self.response[idx]
+
+    def __contains__(self, item):
+        """Allow 'in' operator."""
+        return item in self.response
+
+    def __repr__(self):
+        """Show as a list of dates."""
+        return repr(self.response)

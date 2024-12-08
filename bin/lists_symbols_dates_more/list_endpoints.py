@@ -13,17 +13,18 @@ PASSWORD=os.getenv('THETAPASS')
 
 client = ThetaClient(username=USERNAME, passwd=PASSWORD)
 
-roots = client.roots(security_type="option")
-print(roots)
+# roots = client.roots(security_type="option")
+# print(roots)
 
 exps = client.expirations(root="AAPL")
 print(exps)
 
-dates = client.option_dates(
-    root="AAPL",
-    req="quote",
-    exp=20241025,
-    strike=220000,
-    right='C'
-    )
-print(dates)
+# dates = client.option_dates(
+#     root="AAPL",
+#     req="quote",
+#     exp=20241025,
+#     strike=220000,
+#     right='C'
+#     )
+# print(dates)
+

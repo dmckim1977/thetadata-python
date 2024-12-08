@@ -37,3 +37,53 @@ class DateRange(BaseModel):
         if start_date is not None and v < start_date:
             raise ValueError("end_date must be after start_date")
         return v
+
+
+class RootMixin(BaseModel):
+    """Base model for endpoints that require a root/ticker symbol.
+
+    :param root: The root/ticker symbol (e.g., 'AAPL', 'SPY')
+    """
+    root: str = Field(
+        ...,
+        min_length=1,
+        max_length=10,
+        description="Stock/Option root symbol (ticker)"
+    )
+
+    @field_validator('root')
+    @classmethod
+    def validate_root(cls, v: str) -> str:
+        """Validate and transform root to uppercase."""
+        if not v.strip():
+            raise ValueError("Root cannot be empty or just whitespace")
+        return v.strip().upper()
+
+
+class ExpirationMixin(BaseModel):
+    """Base model for endpoints that require an expiration date.
+
+    :param exp: Expiration date in YYYYMMDD format
+    """
+    exp: int = Field(
+        ...,
+        description="Expiration date in YYYYMMDD format",
+        ge=19000101,  # Basic sanity check for dates
+        le=29991231
+    )
+
+    @field_validator('exp')
+    @classmethod
+    def validate_expiration(cls, v: int) -> int:
+        """Validate expiration date format."""
+        str_date = str(v)
+        if len(str_date) != 8:
+            raise ValueError("Expiration must be in YYYYMMDD format")
+        try:
+            year = int(str_date[:4])
+            month = int(str_date[4:6])
+            day = int(str_date[6:8])
+            date(year, month, day)  # Validate date is real
+            return v
+        except ValueError:
+            raise ValueError(f"Invalid expiration date: {v}")

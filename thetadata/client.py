@@ -1,4 +1,5 @@
 """Module that contains Theta Client class."""
+import json
 import logging
 import socket
 import threading
@@ -6,17 +7,27 @@ import time
 import traceback
 from pathlib import Path
 from threading import Thread
-from typing import get_args
+from typing import List, NoReturn, Type, Union, get_args, io
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
 from . import terminal
 from .enums import *
-from .exceptions import ThetadataValidationError
+from .exceptions import (
+    ThetadataError,
+    ThetadataValidationError,
+    NoDataError,
+    ThetadataConnectionError,  # Changed from ConnectionError
+    AuthenticationError,
+    PermissionError,
+    RateLimitError,
+    ServiceError,
+    ResponseParseError
+)
 from .literals import Rate, SecurityType, Terminal
-from .models.requests import StockHistoricalEODRequest
-from .models.responses import StockHistoricalEODResponse
+from .models.requests import ExpirationsRequest, StockHistoricalEODRequest
+from .models.responses import ExpirationsResponse, StockHistoricalEODResponse
 from .parsing import (
     get_paginated_csv_dataframe,
     get_paginated_dataframe_request,
@@ -429,9 +440,9 @@ class ThetaClient:
                     "You are currently limited to 20 requests/minute. "
                     "A data subscription can be purchased at https://thetadata.net")
 
-            # Download/update terminal if needed
-            if not terminal.check_download(auto_update, stable):
-                raise ConnectionError("Failed to download/verify terminal jar")
+            # # Download/update terminal if needed
+            # if not terminal.check_download(auto_update, stable):
+            #     raise ConnectionError("Failed to download/verify terminal jar")
 
             # Launch and verify terminal
             cwd = jdk_path if use_bundle else Path.cwd()
@@ -525,27 +536,186 @@ class ThetaClient:
                 f"Error response {exc.response.status_code} while requesting "
                 f"{exc.request.url!r}.")
 
+    def _handle_http_error(self, error: httpx.HTTPError,
+                           params: Optional[Dict] = None) -> NoReturn:
+        """Map HTTP errors to appropriate custom exceptions.
+
+        :param error: The HTTP error from httpx
+        :param params: Optional request parameters for context
+        :raises: Appropriate ThetadataError subclass
+        """
+        status_code = error.response.status_code
+        response_body = None
+
+        # Try to get response body if available
+        try:
+            response_body = error.response.json()
+        except Exception:
+            try:
+                response_body = error.response.text
+            except Exception:
+                response_body = str(error)
+
+        # Map status codes to exceptions
+        if status_code == 400:
+            raise ThetadataValidationError(
+                "Invalid request parameters",
+                {"params": params, "response": response_body}
+            )
+        elif status_code == 401:
+            raise AuthenticationError(
+                "Invalid credentials or unauthorized access",
+                {"response": response_body}
+            )
+        elif status_code == 403:
+            raise PermissionError(
+                "Insufficient permissions to access this resource",
+                {"response": response_body}
+            )
+        elif status_code == 404:
+            raise NoDataError(
+                "No data found for the requested parameters",
+                {"params": params}
+            )
+        elif status_code == 429:
+            raise RateLimitError(
+                "Rate limit exceeded",
+                {"response": response_body}
+            )
+        elif status_code == 472:  # ThetaData specific error code
+            raise ThetadataValidationError(
+                "Invalid request parameters or symbol",
+                {"params": params, "response": response_body}
+            )
+        elif status_code >= 500:
+            raise ServiceError(
+                "Service error occurred",
+                response=response_body,
+                status_code=status_code
+            )
+        else:
+            raise ThetadataError(
+                f"Unexpected HTTP status code: {status_code}",
+                {
+                    "status_code": status_code,
+                    "response": response_body,
+                    "params": params
+                }
+            )
+
+    def _make_request(
+            self,
+            url: str,
+            model_response: Type[BaseModel],
+            params: Optional[Dict] = None,
+    ) -> BaseModel:
+        """Make an HTTP request with error handling.
+
+        :param url: The URL to request
+        :param params: Optional query parameters
+        :param model_response: Pydantic model for response validation
+        :return: Validated response model
+        :raises: Various ThetadataError subclasses based on error type
+        """
+        headers = {
+            'User-Agent': f'thetadata-python/{_VERSION}'
+        }
+
+        combined_data = []
+        current_url = url
+        first_response_headers = None
+
+        while current_url is not None:
+            with httpx.stream("GET", current_url, params=params,
+                              headers=headers,
+                              timeout=self.timeout) as response:
+                response.raise_for_status()
+
+                # Store first response headers for metadata
+                if first_response_headers is None:
+                    first_response_headers = dict(response.headers)
+                    logging.info(f"Response headers: {first_response_headers}")
+
+                content_type = response.headers.get('content-type', '')
+
+                # Handle CSV response
+                if 'text/csv' in content_type:
+                    content = io.StringIO()
+                    for line in response.iter_lines():
+                        content.write(line.decode('utf-8') + '\n')
+                    content.seek(0)
+                    df = pd.read_csv(content)
+                    combined_data.extend(df.to_dict('records'))
+
+                # Handle JSON response
+                elif 'application/json' in content_type:
+                    # Read the entire response before parsing JSON
+                    content = response.read()
+                    data = json.loads(content.decode('utf-8'))
+                    if not combined_data:
+                        combined_data = data
+                    else:
+                        combined_data['response'].extend(data['response'])
+                        combined_data['header'] = data['header']
+                else:
+                    raise ResponseParseError(
+                        f"Unexpected content type: {content_type}"
+                    )
+
+            # Check for next page
+            next_page = response.headers.get('next-page')
+            if next_page and next_page.lower() != "null":
+                current_url = next_page
+                params = None  # Don't send params again for subsequent requests
+                logging.info(f"Fetching next page: {current_url}")
+            else:
+                current_url = None
+
+        # For CSV responses, format data to match JSON structure
+        if 'text/csv' in first_response_headers.get('content-type', ''):
+            formatted_response = {
+                'header': {
+                    'format': list(pd.DataFrame(combined_data).columns),
+                    'latency_ms': int(
+                        first_response_headers.get('latency', 0)),
+                    'next_page': None
+                },
+                'response': combined_data
+            }
+            combined_data = formatted_response
+
+        # Validate the combined data
+        try:
+            return model_response.model_validate(combined_data)
+        except ValidationError as e:
+            raise ResponseParseError(
+                "Failed to parse response data",
+                {"validation_errors": e.errors()}
+            )
+
     # endregion
 
     # region LISTING DATA
 
-    def expirations(self, root: str) -> pd.Series:
-        """
-        Get all options expirations for a provided underlying root.
+    def expirations(self, root: str) -> List[int]:
+        """Get all options expirations for a provided underlying root.
 
-        :param root:           The root / underlying / ticker / symbol.
-        :param host:           The ip address of the server
-        :param port:           The port of the server
-
-        :return:               All expirations that ThetaData provides data for.
-        :raises ResponseError: If the request failed.
-        :raises NoData:        If there is no data available for the request.
+        :param root: The root/ticker symbol (e.g., 'AAPL', 'SPY')
+        :return: List of expiration dates in YYYYMMDD format (sorted)
+        :raises ThetadataValidationError: If the request parameters are invalid
+        :raises NoDataError: If no expirations exist for the given root
         """
-        url = f"http://{self.host}:{self.port}/v2/list/expirations"
-        params = {"root": root}
-        res = httpx.get(url, params=params).raise_for_status().json()
-        df = parse_list(res=res, dates=True, name="expirations")
-        return df
+        request = ExpirationsRequest(root=root)
+
+        # Get validated response
+        validated_response = self._make_request(
+            url=f"http://{self.host}:{self.port}/v2/list/expirations",
+            params=request.model_dump(),
+            model_response=ExpirationsResponse
+        )
+
+        # Return just the list of dates
+        return validated_response.response
 
     def roots(self, security_type: SecurityType) -> pd.Series:
         """
@@ -1765,7 +1935,7 @@ class ThetaClient:
                     raise ConnectionError(
                         'Unable to connect to the local Theta Terminal Stream process. '
                         'Try restarting your system.')
-                sleep(1)
+                time.sleep(1)
         self._stream_server.settimeout(10)
         self._stream_impl = callback
         self._stream_connected = True
@@ -1910,7 +2080,7 @@ class ThetaClient:
         tries = 0
         lim = timeout * 100
         while self._stream_responses[req_id] is None:  # This is kind of dumb.
-            sleep(.01)
+            time.sleep(.01)
             tries += 1
             if tries >= lim:
                 return StreamResponseType.TIMED_OUT

@@ -1,6 +1,6 @@
 from pydantic import Field
 
-from .base import DateRange
+from .base import DateRange, RootMixin
 
 
 class StockHistoricalEODRequest(DateRange):
@@ -16,3 +16,11 @@ class StockHistoricalEODRequest(DateRange):
         max_length=10,
         description="Stock symbol/root"
     )
+
+
+class ExpirationsRequest(RootMixin):
+    """Request parameters for getting option expirations.
+
+    :param root: The root/ticker symbol to get expirations for
+    """
+    pass  # Inherits root validation from RootMixin
