@@ -22,13 +22,19 @@ from .exceptions import (
     NoDataError,
     PermissionError,
 )
-from .literals import Rate, SecurityType, Terminal
+from .literals import Rate, SecurityType, StockVenue, Terminal
 from .models.requests import ExpirationsRequest, IndicesHistoricalEODRequest, \
-    IndicesHistoricalPriceRequest, IndicesSnapshotsPriceRequest, \
-    StockHistoricalEODRequest
+    IndicesHistoricalPriceRequest, IndicesSnapshotsOHLCRequest, \
+    IndicesSnapshotsPriceRequest, \
+    StockHistoricalEODRequest, StockHistoricalOHLCRequest, \
+    StockHistoricalQuoteRequest, StockHistoricalTradeRequest
 from .models.responses import ExpirationsResponse, \
     IndicesHistoricalEODResponse, IndicesHistoricalPriceResponse, \
-    IndicesSnapshotsPriceResponse, StockHistoricalEODResponse
+    IndicesSnapshotsOHLCRawResponse, IndicesSnapshotsOHLCResponse, \
+    IndicesSnapshotsPriceRawResponse, \
+    IndicesSnapshotsPriceResponse, \
+    StockHistoricalEODResponse, StockHistoricalOHLCResponse, \
+    StockHistoricalQuoteResponse, StockHistoricalTradeResponse
 from .parsing import (
     get_paginated_csv_dataframe,
     get_paginated_dataframe_request,
@@ -1831,45 +1837,106 @@ class ThetaClient:
 
     def stock_historical_eod_report(
             self,
+            root: str,
             start_date: int,
-            end_date: int,
-            root: str) -> pd.DataFrame:
+            end_date: int
+    ) -> pd.DataFrame:
         """Get historical end-of-day report for a stock.
-
-        :param start_date: Start date in YYYYMMDD format
-        :param end_date: End date in YYYYMMDD format
-        :param root: Stock symbol/root
-        :return: DataFrame with EOD data
         :raises ValidationError: If input parameters are invalid
-        :raises ResponseError: If API request fails
-        :raises NoData: If no data is available
+        :raises NoDataError: If no data exists for params
+        :raises ServiceError: If API service error
         """
         try:
-            # Validate request parameters
             request = StockHistoricalEODRequest(
+                root=root,
                 start_date=start_date,
-                end_date=end_date,
-                root=root
+                end_date=end_date
             )
         except ValidationError as e:
             raise InvalidParamsError(f"Invalid request parameters: {e}")
 
-        url = f"http://{self.host}:{self.port}/v2/hist/stock/eod"
-
-        df = self.get(
-            url=url,
-            request_model=request,
-            response_model=StockHistoricalEODResponse
+        validated_response = self._make_request(
+            url=f"http://{self.host}:{self.port}/v2/hist/stock/eod",
+            params={'use_csv': True, **request.model_dump()},
+            model_response=StockHistoricalEODResponse
         )
 
-        # Map all enum columns in one go
-        df = self.enum_mapper.map_dataframe_enums(df, {
-            'bid_exchange': 'Exchange',
-            'ask_exchange': 'Exchange',
-        })
+        return validated_response.to_pandas()
+
+    def stock_historical_quotes(
+            self,
+            root: str,
+            start_date: int,
+            end_date: int,
+            ivl: int = 900000,
+            rth: bool = True,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None,
+            venue: Optional[StockVenue] = None
+    ) -> pd.DataFrame:
+        """Get historical NBBO quote data for a stock."""
+        try:
+            request = StockHistoricalQuoteRequest(
+                root=root,
+                start_date=start_date,
+                end_date=end_date,
+                ivl=ivl,
+                rth=rth,
+                start_time=start_time,
+                end_time=end_time,
+                venue=venue
+            )
+        except ValidationError as e:
+            raise InvalidParamsError(f"Invalid request parameters: {e}")
+
+        # Filter out None values and convert to params dict
+        params = {k: v for k, v in request.model_dump().items() if
+                  v is not None}
+        params['use_csv'] = True
+
+        # Make request and get validated response
+        validated_response = self._make_request(
+            url=f"http://{self.host}:{self.port}/v2/hist/stock/quote",
+            params=params,
+            model_response=StockHistoricalQuoteResponse
+        )
+
+        # Convert to DataFrame
+        df = validated_response.to_pandas()
 
         return df
 
+    def stock_historical_trades(
+            self,
+            root: str,
+            start_date: int,
+            end_date: int,
+            start_time: Optional[str] = None,
+            end_time: Optional[str] = None,
+            venue: Optional[StockVenue] = None
+    ) -> pd.DataFrame:
+        """Get historical trade data for a stock."""
+        try:
+            request = StockHistoricalTradeRequest(
+                root=root,
+                start_date=start_date,
+                end_date=end_date,
+                start_time=start_time,
+                end_time=end_time,
+                venue=venue
+            )
+        except ValidationError as e:
+            raise InvalidParamsError(f"Invalid request parameters: {e}")
+
+        params = {k: v for k, v in request.model_dump().items() if
+                  v is not None}
+        params['use_csv'] = True
+
+        return self._make_request(
+            url=f"http://{self.host}:{self.port}/v2/hist/stock/trade",
+            params=params,
+            model_response=StockHistoricalTradeResponse
+        ).to_pandas()
 
     # endregion
 
@@ -1894,8 +1961,6 @@ class ThetaClient:
         res = httpx.get(url, params=params).raise_for_status().json()
         df = parse_trade(res=res)
         return df
-
-    # endregion
 
     def indices_historical_eod_report(
             self,
@@ -1988,9 +2053,10 @@ class ThetaClient:
 
         :param root: The index symbol/root (e.g., 'SPX', 'NDX')
         :return: Price snapshot data including:
-                - price: float
-                - date: datetime.date
-                - ms_of_day: datetime.time
+                - price: float (current index price)
+                - date: datetime.date (date of snapshot)
+                - ms_of_day: datetime.time (time of snapshot)
+                - snapshot_datetime: datetime with ET timezone
         :raises InvalidParamsError: If the request parameters are invalid
         :raises NoDataError: If no data exists for the given parameters
         :raises ServiceError: If the API service encounters an error
@@ -2001,15 +2067,55 @@ class ThetaClient:
         except ValidationError as e:
             raise InvalidParamsError(f"Invalid request parameters: {e}")
 
-        # Make request and get validated response
-        validated_response = self._make_request(
+        # Make request and get raw response
+        raw_response = self._make_request(
             url=f"http://{self.host}:{self.port}/v2/snapshot/index/price",
             params=request.model_dump(),
-            model_response=IndicesSnapshotsPriceResponse
+            model_response=IndicesSnapshotsPriceRawResponse
         )
 
-        return validated_response
+        # Convert to formatted response
+        return IndicesSnapshotsPriceResponse.from_raw_response(raw_response)
 
+    def indices_snapshots_ohlc_snapshot(
+            self,
+            root: str,
+    ) -> IndicesSnapshotsOHLCResponse:
+        """Get real-time OHLC snapshot for an index.
+
+        :param root: The index symbol/root (e.g., 'SPX', 'NDX')
+        :return: OHLC snapshot data including:
+                - open: float (opening price of trading session)
+                - high: float (highest price of trading session)
+                - low: float (lowest price of trading session)
+                - close: float (current closing price)
+                - date: datetime.date (date of snapshot)
+                - ms_of_day: datetime.time (time of snapshot)
+                - datetime: datetime with ET timezone
+        :raises InvalidParamsError: If the request parameters are invalid
+        :raises NoDataError: If no data exists for the given parameters
+        :raises ServiceError: If the API service encounters an error
+        """
+        try:
+            # Validate request parameters
+            request = IndicesSnapshotsOHLCRequest(root=root)
+        except ValidationError as e:
+            raise InvalidParamsError(f"Invalid request parameters: {e}")
+
+        try:
+            # Make request and get raw response
+            raw_response = self._make_request(
+                url=f"http://{self.host}:{self.port}/v2/snapshot/index/ohlc",
+                params=request.model_dump(),
+                model_response=IndicesSnapshotsOHLCRawResponse
+            )
+        except httpx.HTTPStatusError as e:
+            self._handle_http_error(e, request.model_dump())
+
+        # Convert to formatted response
+        return IndicesSnapshotsOHLCResponse.from_raw_response(raw_response)
+
+    # endregion
 
     # region ################# STREAMING ########################## # TODO Have not touched yet
     def connect_stream(self, callback) -> Thread:

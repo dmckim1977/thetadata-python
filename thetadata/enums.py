@@ -850,15 +850,97 @@ class QuoteCondition(enum.Enum):
     UNDEFINED = 10000
 
     @classmethod
-    def from_code(cls, code: int) -> QuoteCondition:
-        """Create a MessageType by its associated code.
+    def _missing_(cls, value: object) -> Optional['QuoteCondition']:
+        """Handle missing enum values gracefully."""
+        if isinstance(value, int):
+            return cls.REGULAR  # Default to REGULAR for unknown codes
+        return None
 
-        :raises EnumParseError: If the code does not match a MessageType
-        """
-        for member in cls:
-            if code == member.value:
-                return member
-        return QuoteCondition.UNDEFINED
+
+class Exchange(enum.IntEnum):
+    """Exchange codes and names."""
+    NQEX = 1  # Nasdaq Exchange
+    NQAD = 2  # Nasdaq Alternative Display Facility
+    NYSE = 3  # New York Stock Exchange
+    AMEX = 4  # American Stock Exchange
+    CBOE = 5  # Chicago Board Options Exchange
+    ISEX = 6  # International Securities Exchange
+    PACF = 7  # NYSE ARCA (Pacific)
+    CINC = 8  # National Stock Exchange (Cincinnati)
+    PHIL = 9  # Philadelphia Stock Exchange
+    OPRA = 10  # Options Pricing Reporting Authority
+    BOST = 11  # Boston Stock/Options Exchange
+    NQNM = 12  # Nasdaq Global+Select Market (NMS)
+    NQSC = 13  # Nasdaq Capital Market (SmallCap)
+    NQBB = 14  # Nasdaq Bulletin Board
+    NQPK = 15  # Nasdaq OTC
+    NQIX = 16  # Nasdaq Indexes (GIDS)
+    CHIC = 17  # Chicago Stock Exchange
+    TSE = 18   # Toronto Stock Exchange
+    CDNX = 19  # Canadian Venture Exchange
+    CME = 20   # Chicago Mercantile Exchange
+    NYBT = 21  # New York Board of Trade
+    MRCY = 22  # ISE Mercury
+    COMX = 23  # COMEX (division of NYMEX)
+    CBOT = 24  # Chicago Board of Trade
+    NYMX = 25  # New York Mercantile Exchange
+    KCBT = 26  # Kansas City Board of Trade
+    MGEX = 27  # Minneapolis Grain Exchange
+    NYBO = 28  # NYSE/ARCA Bonds
+    NQBS = 29  # Nasdaq Basic
+    DOWJ = 30  # Dow Jones Indices
+    GEMI = 31  # ISE Gemini
+    SIMX = 32  # Singapore International Monetary Exchange
+    FTSE = 33  # London Stock Exchange
+    EURX = 34  # Eurex
+    IMPL = 35  # Implied Price
+    DTN = 36   # Data Transmission Network
+    LMT = 37   # London Metals Exchange Matched Trades
+    LME = 38   # London Metals Exchange
+    IPEX = 39  # Intercontinental Exchange (IPE)
+    NQMF = 40  # Nasdaq Mutual Funds (MFDS)
+    FCEC = 41  # COMEX Clearport
+    C2 = 42    # CBOE C2 Option Exchange
+    MIAX = 43  # Miami Exchange
+    CLRP = 44  # NYMEX Clearport
+    BARK = 45  # Barclays
+    EMLD = 46  # Miami Emerald Options Exchange
+    NQBX = 47  # NASDAQ Boston
+    HOTS = 48  # HotSpot Eurex US
+    EUUS = 49  # Eurex US
+    EUEU = 50  # Eurex EU
+    ENCM = 51  # Euronext Commodities
+    ENID = 52  # Euronext Index Derivatives
+    ENIR = 53  # Euronext Interest Rates
+    CFE = 54   # CBOE Futures Exchange
+    PBOT = 55  # Philadelphia Board of Trade
+    FCME = 56  # FCME
+    NQNX = 57  # FINRA/NASDAQ Trade Reporting Facility
+    BTRF = 58  # BSE Trade Reporting Facility
+    NTRF = 59  # NYSE Trade Reporting Facility
+    BATS = 60  # BATS Trading
+    FCBT = 61  # CBOT Floor
+    PINK = 62  # Pink Sheets
+    BATY = 63  # BATS Y Exchange
+    EDGE = 64  # Direct Edge A
+    EDGX = 65  # Direct Edge X
+    RUSL = 66  # Russell Indexes
+    CMEX = 67  # CME Indexes
+    IEX = 68   # Investors Exchange
+    PERL = 69  # Miami Pearl Options Exchange
+    LSE = 70   # London Stock Exchange
+    GIF = 71   # NYSE Global Index Feed
+    TSIX = 72  # TSX Indexes
+    MEMX = 73  # Members Exchange
+    EMPT = 74  # EMPTY
+    LTSE = 75  # Long-Term Stock Exchange
+
+    @classmethod
+    def _missing_(cls, value: object) -> Optional['Exchange']:
+        """Handle missing enum values gracefully."""
+        if isinstance(value, int):
+            return cls.NQEX  # Default to NQEX for unknown codes
+        return None
 
 
 @enum.unique
@@ -921,7 +1003,7 @@ class EnumMapper:
         self.register_mapper(
             EnumMapperConfig(
                 enum_type='TradeCondition',
-                fields=['name', 'description'],
+                fields=['name', 'name'],
                 default_handler=lambda x: {"name": f"UNKNOWN_{x}",
                                            "description": f"Unknown Trade Condition ({x})"}
             )
@@ -929,7 +1011,7 @@ class EnumMapper:
         self.register_mapper(
             EnumMapperConfig(
                 enum_type='QuoteCondition',
-                fields=['name', 'description'],
+                fields=['name', 'name'],
                 default_handler=lambda x: {"name": f"UNKNOWN_{x}",
                                            "description": f"Unknown Quote Condition ({x})"}
             )

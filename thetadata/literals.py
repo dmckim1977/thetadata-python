@@ -10,6 +10,8 @@ Terminal = Literal['MDDS', 'FPSS']
 Rate = Literal['SOFR', 'TREASURY_M1', 'TREASURY_M3', 'TREASURY_M6',
     'TREASURY_Y1', 'TREASURY_Y2', 'TREASURY_Y3', 'TREASURY_Y5', 'TREASURY_Y7',
     'TREASURY_Y10', 'TREASURY_Y20', 'TREASURY_Y30']
+StockVenue = Literal["nqb", "utp_cta"]
+
 
 def is_security_type(value: str):  # TODO error checking here
     return value in get_args(SecurityType)
